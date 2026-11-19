@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name "unraid.zh.translator">
 <!ENTITY author "YG">
-<!ENTITY version "2026.11.27">
+<!ENTITY version "2026.11.28">
 <!ENTITY launch "Settings/unraid.zh.translator">
 <!ENTITY plugdir "/boot/config/plugins/&name;">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/jiege6-66/unraid-zh-translator/main/unraid.zh.translator.plg">
@@ -17,7 +17,7 @@
 纯前端替换，不修改任何宿主机文件，卸载即恢复英文。
 </DESCRIPTION>
 <CHANGES>
-### 2026.11.27
+### 2026.11.28
 - 应用商店（Community Applications）与已安装插件页面的英文文案自动译为中文
 - 译文按内容哈希缓存：插件未更新则复用译文，文案变化只重译改动片段
 - 支持任何 OpenAI 兼容接口（含本地 Ollama / LM Studio）
@@ -45,7 +45,7 @@ mkdir -p &plugdir;
 mkdir -p &plugdir;/logs;
 chmod 0770 &plugdir; &plugdir;/logs 2>/dev/null
 [ -w &plugdir; ] || echo "警告：&plugdir; 不可写（/boot 只读或已满），设置将无法保存"
-echo "安装 &name; 2026.11.27"
+echo "安装 &name; 2026.11.28"
 </INLINE>
 </FILE>
 <FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/ajax/configjs.php" Mode="0755"><INLINE><![CDATA[<?php
@@ -4266,13 +4266,40 @@ Link='nav-user'
  *
  * 不做任何 DOM 改写、不覆盖任何宿主插件文件，卸载即恢复原样。
  */
-require_once __DIR__ . '/include/util.php';
+$uztBase = getenv('UZT_PLUGIN_DIR') ?: __DIR__;
+// 与 CA 等官方插件一致：Unraid 渲染 .page 时 __DIR__ 不可靠，用 DOCUMENT_ROOT 定位
+if (!is_file($uztBase . '/include/util.php')) {
+    $uztDocroot = $_SERVER['DOCUMENT_ROOT'] ?? '';
+    $uztDocroot = $uztDocroot !== '' ? rtrim($uztDocroot, '/') : '/usr/local/emhttp';
+    if (is_file($uztDocroot . '/plugins/unraid.zh.translator/include/util.php')) {
+        $uztBase = $uztDocroot . '/plugins/unraid.zh.translator';
+    } else {
+        $uztBase = '/usr/local/emhttp/plugins/unraid.zh.translator';
+    }
+}
+if (!is_file($uztBase . '/include/util.php')) {
+    $uztBase = '/usr/local/emhttp/plugins/unraid.zh.translator';
+}
+// 与 CA 等官方插件一致：Unraid 渲染 .page 时 __DIR__ 不可靠，用 DOCUMENT_ROOT 定位
+if (!is_file($uztBase . '/include/util.php')) {
+    $uztDocroot = $_SERVER['DOCUMENT_ROOT'] ?? '';
+    $uztDocroot = $uztDocroot !== '' ? rtrim($uztDocroot, '/') : '/usr/local/emhttp';
+    if (is_file($uztDocroot . '/plugins/unraid.zh.translator/include/util.php')) {
+        $uztBase = $uztDocroot . '/plugins/unraid.zh.translator';
+    } else {
+        $uztBase = '/usr/local/emhttp/plugins/unraid.zh.translator';
+    }
+}
+if (!is_file($uztBase . '/include/util.php')) {
+    return;   // 文件不完整：静默跳过，不影响宿主页面
+}
+require_once $uztBase . '/include/util.php';
 
 if (!\UZT\Config::bool('ENABLED')) {
     return;
 }
 $base = '/plugins/unraid.zh.translator';
-$stamp = (string)@filemtime(__DIR__ . '/js/store-zh.js');   // 用 __DIR__：装到哪都能取到
+$stamp = (string)@filemtime($uztBase . '/js/store-zh.js');
 if ($stamp === '') {
     $stamp = \UZT\VERSION;
 }
@@ -4289,7 +4316,38 @@ Icon="language"
 /**
  * unraid.zh.translator — 设置页
  */
-require_once __DIR__ . '/include/translator.php';
+// Unraid 渲染 .page 时通常是「读正文再执行」，__DIR__ 不一定指向插件目录，
+// 所以先试 __DIR__（本地 include/CI），失败再回落到安装路径。
+$uztBase = getenv('UZT_PLUGIN_DIR') ?: __DIR__;
+// 与 CA 等官方插件一致：Unraid 渲染 .page 时 __DIR__ 不可靠，用 DOCUMENT_ROOT 定位
+if (!is_file($uztBase . '/include/translator.php')) {
+    $uztDocroot = $_SERVER['DOCUMENT_ROOT'] ?? '';
+    $uztDocroot = $uztDocroot !== '' ? rtrim($uztDocroot, '/') : '/usr/local/emhttp';
+    if (is_file($uztDocroot . '/plugins/unraid.zh.translator/include/translator.php')) {
+        $uztBase = $uztDocroot . '/plugins/unraid.zh.translator';
+    } else {
+        $uztBase = '/usr/local/emhttp/plugins/unraid.zh.translator';
+    }
+}
+if (!is_file($uztBase . '/include/translator.php')) {
+    $uztBase = '/usr/local/emhttp/plugins/unraid.zh.translator';
+}
+// 与 CA 等官方插件一致：Unraid 渲染 .page 时 __DIR__ 不可靠，用 DOCUMENT_ROOT 定位
+if (!is_file($uztBase . '/include/translator.php')) {
+    $uztDocroot = $_SERVER['DOCUMENT_ROOT'] ?? '';
+    $uztDocroot = $uztDocroot !== '' ? rtrim($uztDocroot, '/') : '/usr/local/emhttp';
+    if (is_file($uztDocroot . '/plugins/unraid.zh.translator/include/translator.php')) {
+        $uztBase = $uztDocroot . '/plugins/unraid.zh.translator';
+    } else {
+        $uztBase = '/usr/local/emhttp/plugins/unraid.zh.translator';
+    }
+}
+if (!is_file($uztBase . '/include/translator.php')) {
+    echo '<div style="padding:16px;color:#e0a028">插件文件不完整：找不到 <code>include/translator.php</code>。'
+        . '请在「插件」页面重新安装本插件。</div>';
+    return;
+}
+require_once $uztBase . '/include/translator.php';
 
 $cfg   = \UZT\Config::all();
 $csrf  = \UZT\csrf_token();

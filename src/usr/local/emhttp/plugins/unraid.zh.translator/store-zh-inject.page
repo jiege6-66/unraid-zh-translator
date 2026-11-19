@@ -12,13 +12,40 @@ Link='nav-user'
  *
  * 不做任何 DOM 改写、不覆盖任何宿主插件文件，卸载即恢复原样。
  */
-require_once __DIR__ . '/include/util.php';
+$uztBase = getenv('UZT_PLUGIN_DIR') ?: __DIR__;
+// 与 CA 等官方插件一致：Unraid 渲染 .page 时 __DIR__ 不可靠，用 DOCUMENT_ROOT 定位
+if (!is_file($uztBase . '/include/util.php')) {
+    $uztDocroot = $_SERVER['DOCUMENT_ROOT'] ?? '';
+    $uztDocroot = $uztDocroot !== '' ? rtrim($uztDocroot, '/') : '/usr/local/emhttp';
+    if (is_file($uztDocroot . '/plugins/unraid.zh.translator/include/util.php')) {
+        $uztBase = $uztDocroot . '/plugins/unraid.zh.translator';
+    } else {
+        $uztBase = '/usr/local/emhttp/plugins/unraid.zh.translator';
+    }
+}
+if (!is_file($uztBase . '/include/util.php')) {
+    $uztBase = '/usr/local/emhttp/plugins/unraid.zh.translator';
+}
+// 与 CA 等官方插件一致：Unraid 渲染 .page 时 __DIR__ 不可靠，用 DOCUMENT_ROOT 定位
+if (!is_file($uztBase . '/include/util.php')) {
+    $uztDocroot = $_SERVER['DOCUMENT_ROOT'] ?? '';
+    $uztDocroot = $uztDocroot !== '' ? rtrim($uztDocroot, '/') : '/usr/local/emhttp';
+    if (is_file($uztDocroot . '/plugins/unraid.zh.translator/include/util.php')) {
+        $uztBase = $uztDocroot . '/plugins/unraid.zh.translator';
+    } else {
+        $uztBase = '/usr/local/emhttp/plugins/unraid.zh.translator';
+    }
+}
+if (!is_file($uztBase . '/include/util.php')) {
+    return;   // 文件不完整：静默跳过，不影响宿主页面
+}
+require_once $uztBase . '/include/util.php';
 
 if (!\UZT\Config::bool('ENABLED')) {
     return;
 }
 $base = '/plugins/unraid.zh.translator';
-$stamp = (string)@filemtime(__DIR__ . '/js/store-zh.js');   // 用 __DIR__：装到哪都能取到
+$stamp = (string)@filemtime($uztBase . '/js/store-zh.js');
 if ($stamp === '') {
     $stamp = \UZT\VERSION;
 }
