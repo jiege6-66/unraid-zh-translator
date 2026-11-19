@@ -299,7 +299,20 @@ rm -f /boot/config/plugins/dynamix/unraid.zh.translator.cron
 
 ---
 
-## 12. 开发与测试
+## 12. 发布新版本（维护者）
+
+```bash
+./build.sh 2026.11.25        # 版本号必须比上一版大，Unraid 靠它判断"有更新"
+git add -A && git commit -m "2026.11.25: 说明本次改动"
+git push                     # 推到 main 后，用户在插件页点「检查更新」即可原地覆盖
+```
+
+- 打包会自动把 `dist/<name>.plg` 复制一份到仓库根目录（发布件），并做 XML 自检；
+- 安装脚本会清理历史副本，所以更新后不会出现两个同名插件；
+- `pluginURL` 固定指向 `raw.githubusercontent.com/.../main/<name>.plg`，
+  用户装一次之后就不再需要手动下载。
+
+## 13. 开发与测试
 
 ```bash
 ./build.sh 2026.11.20      # 生成 dist/unraid.zh.translator.plg（自包含，内联全部文件）
