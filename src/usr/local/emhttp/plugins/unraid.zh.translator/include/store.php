@@ -571,17 +571,23 @@ final class Store
      * - 短文本（< $minChars）多为名称/标签，不需要翻译；
      * - 只翻译商店时，顺带清掉本机插件描述。
      */
-    public function compactQueue(int $minChars, bool $dropLocalPlugins): int
+    public function compactQueue(int $minChars, bool $dropLocalPlugins, bool $onlyPageCaptured = false): int
     {
         if ($this->backend === 'sqlite') {
             // 注意：SQLite 里 INTEGER 与 TEXT 比较时「整数恒小于文本」，
             // 所以数字条件不能靠 PDO 的 ? 绑定（默认按字符串传），必须内联。
             $min = max(0, (int)$minChars);
-            if ($dropLocalPlugins) {
-                $sql = 'DELETE FROM seg WHERE st <> 1 AND (LENGTH(src) < ' . $min . ' OR kind IN ("localdesc","localchg"))';
+            $conds = [];
+            if ($onlyPageCaptured) {
+                // 只清「页面即时采集」的短文本：应用源里本来就有的短标签（分类名、字段名）保留
+                $conds[] = '(kind = "live" AND LENGTH(src) < ' . $min . ')';
             } else {
-                $sql = 'DELETE FROM seg WHERE st <> 1 AND LENGTH(src) < ' . $min;
+                $conds[] = 'LENGTH(src) < ' . $min;
             }
+            if ($dropLocalPlugins) {
+                $conds[] = 'kind IN ("localdesc","localchg")';
+            }
+            $sql = 'DELETE FROM seg WHERE st <> 1 AND (' . implode(' OR ', $conds) . ')';
             return (int)$this->pdo->exec($sql);
         }
         $n = 0;
@@ -589,8 +595,9 @@ final class Store
             if ($s['st'] === 1) {
                 continue;
             }
-            if (mb_strlen((string)$s['src'], 'UTF-8') < $minChars
-                || ($dropLocalPlugins && in_array((string)$s['kind'], ['localdesc', 'localchg'], true))) {
+            $tooShort = mb_strlen((string)$s['src'], 'UTF-8') < $minChars
+                && (!$onlyPageCaptured || $s['kind'] === 'live');
+            if ($tooShort || ($dropLocalPlugins && in_array((string)$s['kind'], ['localdesc', 'localchg'], true))) {
                 unset($this->mem['seg'][$h]);
                 $n++;
             }

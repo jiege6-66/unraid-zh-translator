@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name "unraid.zh.translator">
 <!ENTITY author "YG">
-<!ENTITY version "2026.11.19">
+<!ENTITY version "2026.11.27">
 <!ENTITY launch "Settings/unraid.zh.translator">
 <!ENTITY plugdir "/boot/config/plugins/&name;">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/jiege6-66/unraid-zh-translator/main/unraid.zh.translator.plg">
@@ -17,7 +17,7 @@
 纯前端替换，不修改任何宿主机文件，卸载即恢复英文。
 </DESCRIPTION>
 <CHANGES>
-### 2026.11.19
+### 2026.11.27
 - 应用商店（Community Applications）与已安装插件页面的英文文案自动译为中文
 - 译文按内容哈希缓存：插件未更新则复用译文，文案变化只重译改动片段
 - 支持任何 OpenAI 兼容接口（含本地 Ollama / LM Studio）
@@ -45,7 +45,7 @@ mkdir -p &plugdir;
 mkdir -p &plugdir;/logs;
 chmod 0770 &plugdir; &plugdir;/logs 2>/dev/null
 [ -w &plugdir; ] || echo "警告：&plugdir; 不可写（/boot 只读或已满），设置将无法保存"
-echo "安装 &name; 2026.11.19"
+echo "安装 &name; 2026.11.27"
 </INLINE>
 </FILE>
 <FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/ajax/configjs.php" Mode="0755"><INLINE><![CDATA[<?php
@@ -319,6 +319,8 @@ try {
             'log_writable' => is_writable(dirname(log_file())),
             'boot_writable' => is_writable(cfg_dir()),
             'var_dir' => var_dir(),
+            'model_avg_ms' => (int)$store->getMeta('llm_avg_ms', '0'),
+            'policy_ver' => $store->getMeta('policy_ver'),
             'feed_source' => $store->getMeta('feed_source'),
             'feed_age' => (int)$store->getMeta('feed_age', '0'),
             'feed_from_local' => $store->getMeta('feed_from_local') === '1',
@@ -2284,17 +2286,23 @@ final class Store
      * - 短文本（< $minChars）多为名称/标签，不需要翻译；
      * - 只翻译商店时，顺带清掉本机插件描述。
      */
-    public function compactQueue(int $minChars, bool $dropLocalPlugins): int
+    public function compactQueue(int $minChars, bool $dropLocalPlugins, bool $onlyPageCaptured = false): int
     {
         if ($this->backend === 'sqlite') {
             // 注意：SQLite 里 INTEGER 与 TEXT 比较时「整数恒小于文本」，
             // 所以数字条件不能靠 PDO 的 ? 绑定（默认按字符串传），必须内联。
             $min = max(0, (int)$minChars);
-            if ($dropLocalPlugins) {
-                $sql = 'DELETE FROM seg WHERE st <> 1 AND (LENGTH(src) < ' . $min . ' OR kind IN ("localdesc","localchg"))';
+            $conds = [];
+            if ($onlyPageCaptured) {
+                // 只清「页面即时采集」的短文本：应用源里本来就有的短标签（分类名、字段名）保留
+                $conds[] = '(kind = "live" AND LENGTH(src) < ' . $min . ')';
             } else {
-                $sql = 'DELETE FROM seg WHERE st <> 1 AND LENGTH(src) < ' . $min;
+                $conds[] = 'LENGTH(src) < ' . $min;
             }
+            if ($dropLocalPlugins) {
+                $conds[] = 'kind IN ("localdesc","localchg")';
+            }
+            $sql = 'DELETE FROM seg WHERE st <> 1 AND (' . implode(' OR ', $conds) . ')';
             return (int)$this->pdo->exec($sql);
         }
         $n = 0;
@@ -2302,8 +2310,9 @@ final class Store
             if ($s['st'] === 1) {
                 continue;
             }
-            if (mb_strlen((string)$s['src'], 'UTF-8') < $minChars
-                || ($dropLocalPlugins && in_array((string)$s['kind'], ['localdesc', 'localchg'], true))) {
+            $tooShort = mb_strlen((string)$s['src'], 'UTF-8') < $minChars
+                && (!$onlyPageCaptured || $s['kind'] === 'live');
+            if ($tooShort || ($dropLocalPlugins && in_array((string)$s['kind'], ['localdesc', 'localchg'], true))) {
                 unset($this->mem['seg'][$h]);
                 $n++;
             }
@@ -2487,6 +2496,9 @@ require_once __DIR__ . '/source_local.php';
 
 final class Translator
 {
+    /** 采集策略版本：升级后首次同步会自动精简旧队列（清理名称/短标签这类历史条目） */
+    public const POLICY_VERSION = 2;
+
     public static function store(): Store
     {
         return Store::open();
@@ -2659,6 +2671,13 @@ final class Translator
             $hourlyCap = max(0, Config::int('HOURLY_CHAR_BUDGET', 120000));
             $hourlyUsed = (int)$store->getMeta($hourKey, '0');
             $withinBudget = $hourlyCap === 0 || ($hourlyUsed + $chars) <= $hourlyCap;
+            // 模型太慢时，宁可先入队：同步等 60 秒的页面体验比看到英文还糟
+            $avgMs = (int)$store->getMeta('llm_avg_ms', '0');
+            $slowModel = $avgMs > 15000;
+            if ($slowModel && $allowSync) {
+                $allowSync = false;
+                $error = sprintf('模型较慢（上次平均 %.0f 秒/批），已改为后台排队翻译', $avgMs / 1000);
+            }
             if ($allowSync && Config::bool('AUTO_NEW') && $chars <= $budget && count($miss) <= 40 && $withinBudget) {
                 $store->setMeta($hourKey, (string)($hourlyUsed + $chars));
                 $llm = new Llm();
@@ -2736,6 +2755,7 @@ final class Translator
             'failed' => $failed,
             'rev' => $store->revision(),
             'asked' => count($reqs),
+            'slow_model' => $slowModel,
             'error' => $error,
         ];
     }
@@ -2921,14 +2941,15 @@ final class Translator
     }
 
     /** 精简队列：删掉未完成且不符合「只看简介」策略的片段 */
-    public static function compact(?bool $dropLocal = null): array
+    public static function compact(?bool $dropLocal = null, bool $onlyPageCaptured = false): array
     {
         $min = max(0, Config::int('LIVE_MIN_CHARS', 40));
         $dropLocal ??= (Config::get('SCOPE') === 'store');
-        $n = self::store()->compactQueue($min, $dropLocal);
+        $n = self::store()->compactQueue($min, $dropLocal, $onlyPageCaptured);
         self::store()->event('compact -' . $n, $n);
-        jlog(sprintf('精简队列：删除 %d 条短文本/本机插件片段（阈值 %d 字符，缩放本机插件=%s）',
-            $n, $min, $dropLocal ? '是' : '否'));
+        jlog(sprintf('精简队列：删除 %d 条%s（阈值 %d 字符，含本机插件=%s）',
+            $n, $onlyPageCaptured ? '页面误采的短文本' : '短文本/本机插件片段',
+            $min, $dropLocal ? '是' : '否'));
         return ['ok' => true, 'removed' => $n, 'min_chars' => $min, 'drop_local' => $dropLocal];
     }
 
@@ -2975,6 +2996,14 @@ final class Translator
                     $up['existed'] += $up2['existed'];
                     $store->setApps($local['apps']);
                 }
+            }
+
+            // 策略升级：老版本可能把应用名/短标签排进了队列，这里自动清一次
+            $applied = (int)$store->getMeta('policy_ver', '0');
+            if ($applied < self::POLICY_VERSION) {
+                $c = self::compact(null, true);   // 只清旧策略从页面误采的短文本
+                $store->setMeta('policy_ver', (string)self::POLICY_VERSION);
+                $say(sprintf('策略升级：已精简旧队列 %d 条（阈值 %d 字符）', $c['removed'], $c['min_chars']));
             }
 
             $store->setApps($parsed['apps']);
@@ -3741,7 +3770,10 @@ function human_bytes(int $n): string
             'cursor:pointer;user-select:none;opacity:.72;transition:opacity .15s}',
             '#uzt-lang-switch:hover{opacity:1}',
             '#uzt-lang-switch span{display:block;padding:6px 10px;border-radius:999px;color:#c9c9c9}',
-            '#uzt-lang-switch span.on{background:#ff8c2f;color:#fff}'
+            '#uzt-lang-switch span.on{background:#ff8c2f;color:#fff}',
+            '#uzt-lang-switch[data-busy="1"]::after{content:"";width:6px;height:6px;margin:4px 6px 0 2px;',
+            'border-radius:50%;background:#ff8c2f;animation:uzt-pulse 1s ease-in-out infinite}',
+            '@keyframes uzt-pulse{0%,100%{opacity:.25}50%{opacity:1}}'
         ].join('');
         document.head.appendChild(css);
         pill.addEventListener('click', function (ev) {
@@ -3805,6 +3837,7 @@ function human_bytes(int $n): string
         }
         stats.requests++;
         for (var q = 0; q < items.length; q++) { asked[items[q].key] = 1; }
+        if (pill) { pill.setAttribute('data-busy', '1'); }
         return post('lookup', {
             texts: texts,
             csrf: CFG.csrf || '',
@@ -3837,8 +3870,12 @@ function human_bytes(int $n): string
             if (queuedSeen > 0 && Object.keys(hits).length < texts.length) {
                 scheduleRetry();
             }
+        }).then(function (r) {
+            if (pill) { pill.removeAttribute('data-busy'); }
+            return r;
         }).catch(function (e) {
             stats.lastError = String(e && e.message || e);
+            if (pill) { pill.removeAttribute('data-busy'); }
             // 请求失败：允许下次重新尝试同一批文本
             for (var z = 0; z < items.length; z++) { delete asked[items[z].key]; }
         });
@@ -4705,6 +4742,10 @@ $sel = static function (string $key, array $opts) use ($cfg): string {
         bits2.push('PHP CLI ' + (e2.php_cli || '未找到'));
         bits2.push('日志目录' + (e2.log_writable ? '可写' : '不可写'));
         bits2.push('/boot' + (e2.boot_writable ? '可写' : '不可写'));
+        if (e2.model_avg_ms > 0) {
+          bits2.push('模型 ' + (e2.model_avg_ms / 1000).toFixed(1) + ' 秒/批'
+            + (e2.model_avg_ms > 15000 ? '（较慢，页面改为后台翻译）' : ''));
+        }
         if (e2.ca_local && e2.ca_local.file) {
           bits2.push('CA 本地源 ' + humanDur(e2.ca_local.age) + '前');
         } else {

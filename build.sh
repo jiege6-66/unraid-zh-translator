@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 
 NAME="unraid.zh.translator"
 AUTHOR="${AUTHOR:-YG}"
-VERSION="${1:-$(date +%Y.%m.%d)}"
+VERSION="${1:-$(cat VERSION 2>/dev/null || date +%Y.%m.%d)}"
 # 自动更新用的 .plg 地址：放到你自己的仓库后改这里或传环境变量
 PLUGIN_URL="${PLUGIN_URL:-https://raw.githubusercontent.com/jiege6-66/unraid-zh-translator/main/${NAME}.plg}"
 SRC="src/usr/local/emhttp/plugins/${NAME}"
@@ -128,7 +128,12 @@ echo
 PLGTAIL
 
 mv "$TMP" "$OUT"
-cp -f "$OUT" "${NAME}.plg"
+# 发布件复制到仓库根目录；测试/CI 用 PUBLISH=0 跳过，避免覆盖线上版本
+if [ "${PUBLISH:-1}" = "1" ]; then
+  cp -f "$OUT" "${NAME}.plg"
+else
+  echo "（PUBLISH=0：不更新仓库根目录的发布件）"
+fi
 trap - EXIT
 
 # 自检：XML 必须能解析（历史上踩过 && 裸 & 把包写坏的坑）
@@ -138,4 +143,4 @@ d = m.parse(sys.argv[1])
 files = [f for f in d.getElementsByTagName('FILE') if f.getAttribute('Name')]
 assert files, '没有内联任何文件'
 PYCHK
-echo "已生成: $OUT 与 ./${NAME}.plg ($(wc -c < "$OUT") 字节, $(grep -c '<FILE ' "$OUT") 个文件)"
+echo "已生成: $OUT (版本 $VERSION, $(wc -c < "$OUT") 字节, $(grep -c '<FILE ' "$OUT") 个文件)"

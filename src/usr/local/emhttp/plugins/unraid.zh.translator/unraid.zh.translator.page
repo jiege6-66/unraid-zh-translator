@@ -459,6 +459,10 @@ $sel = static function (string $key, array $opts) use ($cfg): string {
         bits2.push('PHP CLI ' + (e2.php_cli || '未找到'));
         bits2.push('日志目录' + (e2.log_writable ? '可写' : '不可写'));
         bits2.push('/boot' + (e2.boot_writable ? '可写' : '不可写'));
+        if (e2.model_avg_ms > 0) {
+          bits2.push('模型 ' + (e2.model_avg_ms / 1000).toFixed(1) + ' 秒/批'
+            + (e2.model_avg_ms > 15000 ? '（较慢，页面改为后台翻译）' : ''));
+        }
         if (e2.ca_local && e2.ca_local.file) {
           bits2.push('CA 本地源 ' + humanDur(e2.ca_local.age) + '前');
         } else {

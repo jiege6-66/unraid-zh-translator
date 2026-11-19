@@ -171,7 +171,7 @@ plugin install /path/to/unraid.zh.translator.plg
 
 ### 翻译什么，不翻译什么
 
-只翻**简介类内容**（这是刻意收紧的）：
+只翻**简介类内容**（这是刻意收紧的；**策略升级后第一次同步会自动清掉旧版本误采的短文本**，应用源里的分类名/字段名不受影响）：
 
 | 会翻译 | 不翻译 |
 |---|---|
@@ -214,6 +214,7 @@ plugin install /path/to/unraid.zh.translator.plg
 | 简介阈值 LIVE_MIN_CHARS | 40 | 页面新文案低于此长度且词数 <6 时不翻译（名称保护） |
 | 最大尝试次数 | 8 | 失败按 2ⁿ 分钟退避重排，超过才彻底放弃 |
 | 自动续跑 | 开 | 到达时间预算且队列未空时自动开下一轮（链长上限 40） |
+| 慢模型保护 | 自动 | 上次平均耗时 >15 秒/批时，页面不再同步等译文，改为后台排队（概览会显示「模型 X 秒/批（较慢…）」） |
 | 每小时同步翻译预算 | 120000 字符 | 超出后只入队（0=不限），防止某个页面把额度刷爆 |
 | JSON 模式 | auto | 不支持 `response_format` 的服务会自动降级重试 |
 | 温度 | 0.2 | 翻译任务建议保持低值 |
@@ -317,8 +318,8 @@ git push                     # 推到 main 后，用户在插件页点「检查�
 ```bash
 ./build.sh 2026.11.25      # 生成 dist/*.plg 与仓库根目录的发布件（自包含，内联全部文件）
 
-# ① 任意机器（含 CI，无需 root、不写系统目录）—— 27 项核心断言
-php tests/core.php
+# ① 任意机器（含 CI，无需 root、不写系统目录）—— 34 项核心断言
+php tests/core.php        # 34 项
 node tests/norm_parity.mjs && node tests/rules_parity.mjs && node tests/dom.test.mjs
 php tests/policy.php && php tests/render_page.php
 

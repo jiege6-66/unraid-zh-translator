@@ -262,6 +262,28 @@ $drop = Translator::dropPending();
 $after = Store::open()->stats()['total'];
 $check('清空未译队列只删未完成项', ($drop['removed'] ?? 0) > 0 && $after < $before, "before={$before} after={$after}");
 
+// ---------------------------------------------------------------- 策略升级 / 慢模型
+$section('策略升级自动精简 / 慢模型保护');
+Store::open()->setMeta('policy_ver', '1');
+$legacy = \UZT\segment_hash('LegacyShortLabel');
+Store::open()->upsertSegments([['h' => $legacy, 'src' => 'LegacyShortLabel', 'kind' => 'live', 'app' => '']]);
+Translator::sync(false, null);
+$legacyLeft = Store::open()->getByHashes([$legacy]);
+$check('策略升级后旧「页面误采」短文本被自动清理', !isset($legacyLeft[$legacy]));
+$feedShort = Store::open()->getByHashes([\UZT\segment_hash('Video')]);
+$check('应用源里的短标签（如分类 Video）不受迁移影响', isset($feedShort[\UZT\segment_hash('Video')]));
+$check('策略版本已记录', Store::open()->getMeta('policy_ver') === (string)Translator::POLICY_VERSION, Store::open()->getMeta('policy_ver'));
+
+Store::open()->setMeta('llm_avg_ms', '60000');
+$modelCallsBefore = is_file($mockLog) ? count(file($mockLog)) : 0;
+$slow = Translator::lookup(['A brand new descriptive sentence that is long enough to qualify for translation.'], true);
+$modelCallsAfter = is_file($mockLog) ? count(file($mockLog)) : 0;
+$check('慢模型时不做同步翻译', ($slow['translated_now'] ?? -1) === 0, json_encode($slow, JSON_UNESCAPED_UNICODE));
+$check('慢模型时返回 slow_model 标记', !empty($slow['slow_model']));
+$check('慢模型时零模型调用', $modelCallsBefore === $modelCallsAfter, "{$modelCallsBefore} -> {$modelCallsAfter}");
+$check('慢模型时文案进入队列', ($slow['queued'] ?? 0) >= 1, json_encode($slow, JSON_UNESCAPED_UNICODE));
+Store::open()->setMeta('llm_avg_ms', '0');
+
 // ---------------------------------------------------------------- 结论
 echo "\n════════════════════════════════════════\n";
 echo " 通过 {$pass} 项 / 失败 {$fail} 项\n";

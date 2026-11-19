@@ -43,7 +43,7 @@ for f in src/usr/local/emhttp/plugins/$PLUGIN/js/*.js; do
 done
 
 step "2. 打包 / 安装 / 一致性"
-if ./build.sh "${VERSION:-$(date +%Y.%m.%d)}" >/dev/null 2>&1; then ok "build.sh 生成 dist/$PLUGIN.plg"; else bad "build.sh"; fi
+if PUBLISH=0 ./build.sh 0.0.0-test >/dev/null 2>&1; then ok "build.sh 生成 dist/$PLUGIN.plg（测试版本，不动发布件）"; else bad "build.sh"; fi
 python3 - <<'PY' && ok ".plg 是合法 XML 且含 16 个数据文件" || bad ".plg XML 结构"
 import xml.dom.minidom as m, sys
 d=m.parse('dist/unraid.zh.translator.plg')

@@ -20,6 +20,9 @@ require_once __DIR__ . '/source_local.php';
 
 final class Translator
 {
+    /** 采集策略版本：升级后首次同步会自动精简旧队列（清理名称/短标签这类历史条目） */
+    public const POLICY_VERSION = 2;
+
     public static function store(): Store
     {
         return Store::open();
@@ -192,6 +195,13 @@ final class Translator
             $hourlyCap = max(0, Config::int('HOURLY_CHAR_BUDGET', 120000));
             $hourlyUsed = (int)$store->getMeta($hourKey, '0');
             $withinBudget = $hourlyCap === 0 || ($hourlyUsed + $chars) <= $hourlyCap;
+            // 模型太慢时，宁可先入队：同步等 60 秒的页面体验比看到英文还糟
+            $avgMs = (int)$store->getMeta('llm_avg_ms', '0');
+            $slowModel = $avgMs > 15000;
+            if ($slowModel && $allowSync) {
+                $allowSync = false;
+                $error = sprintf('模型较慢（上次平均 %.0f 秒/批），已改为后台排队翻译', $avgMs / 1000);
+            }
             if ($allowSync && Config::bool('AUTO_NEW') && $chars <= $budget && count($miss) <= 40 && $withinBudget) {
                 $store->setMeta($hourKey, (string)($hourlyUsed + $chars));
                 $llm = new Llm();
@@ -269,6 +279,7 @@ final class Translator
             'failed' => $failed,
             'rev' => $store->revision(),
             'asked' => count($reqs),
+            'slow_model' => $slowModel,
             'error' => $error,
         ];
     }
@@ -454,14 +465,15 @@ final class Translator
     }
 
     /** 精简队列：删掉未完成且不符合「只看简介」策略的片段 */
-    public static function compact(?bool $dropLocal = null): array
+    public static function compact(?bool $dropLocal = null, bool $onlyPageCaptured = false): array
     {
         $min = max(0, Config::int('LIVE_MIN_CHARS', 40));
         $dropLocal ??= (Config::get('SCOPE') === 'store');
-        $n = self::store()->compactQueue($min, $dropLocal);
+        $n = self::store()->compactQueue($min, $dropLocal, $onlyPageCaptured);
         self::store()->event('compact -' . $n, $n);
-        jlog(sprintf('精简队列：删除 %d 条短文本/本机插件片段（阈值 %d 字符，缩放本机插件=%s）',
-            $n, $min, $dropLocal ? '是' : '否'));
+        jlog(sprintf('精简队列：删除 %d 条%s（阈值 %d 字符，含本机插件=%s）',
+            $n, $onlyPageCaptured ? '页面误采的短文本' : '短文本/本机插件片段',
+            $min, $dropLocal ? '是' : '否'));
         return ['ok' => true, 'removed' => $n, 'min_chars' => $min, 'drop_local' => $dropLocal];
     }
 
@@ -508,6 +520,14 @@ final class Translator
                     $up['existed'] += $up2['existed'];
                     $store->setApps($local['apps']);
                 }
+            }
+
+            // 策略升级：老版本可能把应用名/短标签排进了队列，这里自动清一次
+            $applied = (int)$store->getMeta('policy_ver', '0');
+            if ($applied < self::POLICY_VERSION) {
+                $c = self::compact(null, true);   // 只清旧策略从页面误采的短文本
+                $store->setMeta('policy_ver', (string)self::POLICY_VERSION);
+                $say(sprintf('策略升级：已精简旧队列 %d 条（阈值 %d 字符）', $c['removed'], $c['min_chars']));
             }
 
             $store->setApps($parsed['apps']);

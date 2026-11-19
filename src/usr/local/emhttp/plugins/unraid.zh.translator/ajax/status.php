@@ -58,6 +58,8 @@ try {
             'log_writable' => is_writable(dirname(log_file())),
             'boot_writable' => is_writable(cfg_dir()),
             'var_dir' => var_dir(),
+            'model_avg_ms' => (int)$store->getMeta('llm_avg_ms', '0'),
+            'policy_ver' => $store->getMeta('policy_ver'),
             'feed_source' => $store->getMeta('feed_source'),
             'feed_age' => (int)$store->getMeta('feed_age', '0'),
             'feed_from_local' => $store->getMeta('feed_from_local') === '1',

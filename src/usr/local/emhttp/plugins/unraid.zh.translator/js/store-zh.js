@@ -275,7 +275,10 @@
             'cursor:pointer;user-select:none;opacity:.72;transition:opacity .15s}',
             '#uzt-lang-switch:hover{opacity:1}',
             '#uzt-lang-switch span{display:block;padding:6px 10px;border-radius:999px;color:#c9c9c9}',
-            '#uzt-lang-switch span.on{background:#ff8c2f;color:#fff}'
+            '#uzt-lang-switch span.on{background:#ff8c2f;color:#fff}',
+            '#uzt-lang-switch[data-busy="1"]::after{content:"";width:6px;height:6px;margin:4px 6px 0 2px;',
+            'border-radius:50%;background:#ff8c2f;animation:uzt-pulse 1s ease-in-out infinite}',
+            '@keyframes uzt-pulse{0%,100%{opacity:.25}50%{opacity:1}}'
         ].join('');
         document.head.appendChild(css);
         pill.addEventListener('click', function (ev) {
@@ -339,6 +342,7 @@
         }
         stats.requests++;
         for (var q = 0; q < items.length; q++) { asked[items[q].key] = 1; }
+        if (pill) { pill.setAttribute('data-busy', '1'); }
         return post('lookup', {
             texts: texts,
             csrf: CFG.csrf || '',
@@ -371,8 +375,12 @@
             if (queuedSeen > 0 && Object.keys(hits).length < texts.length) {
                 scheduleRetry();
             }
+        }).then(function (r) {
+            if (pill) { pill.removeAttribute('data-busy'); }
+            return r;
         }).catch(function (e) {
             stats.lastError = String(e && e.message || e);
+            if (pill) { pill.removeAttribute('data-busy'); }
             // 请求失败：允许下次重新尝试同一批文本
             for (var z = 0; z < items.length; z++) { delete asked[items[z].key]; }
         });
