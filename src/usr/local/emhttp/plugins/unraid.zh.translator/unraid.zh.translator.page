@@ -6,7 +6,7 @@ Icon="language"
 /**
  * unraid.zh.translator — 设置页
  */
-require_once '/usr/local/emhttp/plugins/unraid.zh.translator/include/translator.php';
+require_once __DIR__ . '/include/translator.php';
 
 $cfg   = \UZT\Config::all();
 $csrf  = \UZT\csrf_token();

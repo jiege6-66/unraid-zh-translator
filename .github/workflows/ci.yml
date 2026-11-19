@@ -6,28 +6,59 @@ on:
   pull_request:
 
 jobs:
-  syntax:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.2'
+          extensions: curl, mbstring, pdo_sqlite
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 依赖（jsdom 用于前端断言）
+        run: npm install --prefix tests --no-audit --no-fund jsdom@25
+
       - name: PHP 语法检查
         run: |
           fail=0
           while IFS= read -r f; do php -l "$f" >/dev/null || fail=1; done < <(find src \( -name '*.php' -o -name '*.page' \))
           exit $fail
+
       - name: JS 语法检查
         run: |
-          node --version
           for f in src/usr/local/emhttp/plugins/unraid.zh.translator/js/*.js; do node --check "$f"; done
+
+      - name: PHP ⇄ JS 一致性
+        run: |
+          node tests/norm_parity.mjs
+          node tests/rules_parity.mjs
+
+      - name: 前端替换（jsdom）
+        run: node tests/dom.test.mjs
+
+      - name: 策略与页面渲染（临时目录，无需 root）
+        env:
+          UZT_CFG_DIR: ${{ runner.temp }}/uzt-cfg
+          UZT_VAR_DIR: ${{ runner.temp }}/uzt-var
+          UZT_LOCK_DIR: ${{ runner.temp }}
+        run: |
+          php tests/policy.php
+          php tests/render_page.php
+
+      - name: 核心链路（同步/翻译/幂等/增量/分片/退避/精简）
+        run: php tests/core.php
+
       - name: 打包校验
         run: |
           ./build.sh "$(date +%Y.%m.%d)"
           python3 - <<'PY'
           import xml.dom.minidom as m
-          d = m.parse('dist/unraid.zh.translator.plg')
+          d = m.parse('unraid.zh.translator.plg')
           files = [f for f in d.getElementsByTagName('FILE') if f.getAttribute('Name')]
           assert len(files) >= 16, len(files)
           print('plg OK,', len(files), 'files')

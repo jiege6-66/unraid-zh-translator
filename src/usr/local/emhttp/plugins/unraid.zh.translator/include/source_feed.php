@@ -50,12 +50,18 @@ final class SourceFeed
      */
     public static function localCandidates(): array
     {
-        $list = [
+        $list = [];
+        // 测试/CI 用：把假 feed 指到这里即可（生产不设）
+        $fake = getenv('UZT_FAKE_CA_FEED');
+        if (is_string($fake) && $fake !== '') {
+            $list[] = $fake;
+        }
+        $list = array_merge($list, [
             '/tmp/GitHub/AppFeed/applicationFeed.json',
             '/tmp/community.applications/AppFeed/applicationFeed.json',
             '/tmp/community.applications/tempFiles/applicationFeed.json',
             '/tmp/community.applications/applicationFeed.json',
-        ];
+        ]);
         foreach (glob('/tmp/*/AppFeed/applicationFeed.json') ?: [] as $g) {
             $list[] = $g;
         }

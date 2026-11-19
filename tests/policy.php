@@ -8,7 +8,8 @@
  */
 declare(strict_types=1);
 
-require_once '/usr/local/emhttp/plugins/unraid.zh.translator/include/translator.php';
+$pluginDir = getenv('UZT_PLUGIN_DIR') ?: dirname(__DIR__) . '/src/usr/local/emhttp/plugins/unraid.zh.translator';
+require_once $pluginDir . '/include/translator.php';
 
 $fail = 0;
 $check = static function (string $name, bool $cond, string $extra = '') use (&$fail): void {

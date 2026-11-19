@@ -27,6 +27,13 @@ s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()
 PY
 }
 
+step "0. 核心链路（临时目录，无需 root）"
+if php tests/core.php >/tmp/uzt-core.log 2>&1; then
+  ok "$(grep -oE '通过 [0-9]+ 项' /tmp/uzt-core.log | head -1) 核心断言通过"
+else
+  bad "核心链路" "$(tail -5 /tmp/uzt-core.log)"
+fi
+
 step "1. PHP 语法检查"
 while IFS= read -r f; do
   if php -l "$f" >/dev/null 2>&1; then ok "php -l ${f#src/usr/local/emhttp/plugins/$PLUGIN/}"; else bad "php -l $f" "$(php -l "$f" 2>&1|head -2)"; fi

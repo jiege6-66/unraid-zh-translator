@@ -23,15 +23,30 @@ function plugin_dir(): string
     return $d;
 }
 
-/** 持久化目录（U 盘 /boot，重启后仍在） */
+/**
+ * 持久化目录（U 盘 /boot，重启后仍在）。
+ * UZT_CFG_DIR 仅供测试/CI 指向临时目录，生产环境不设即保持默认。
+ */
 function cfg_dir(): string
 {
+    $override = getenv('UZT_CFG_DIR');
+    if (is_string($override) && $override !== '') {
+        return rtrim($override, '/');
+    }
     return '/boot/config/plugins/' . PLUGIN;
 }
 
 /** 运行期目录：优先 RAM，避免折磨 U 盘 */
 function var_dir(): string
 {
+    $override = getenv('UZT_VAR_DIR');
+    if (is_string($override) && $override !== '') {
+        $d = rtrim($override, '/');
+        if (!is_dir($d)) {
+            @mkdir($d, 0775, true);
+        }
+        return $d;
+    }
     $d = '/usr/local/emhttp/plugins/' . PLUGIN . '/var';
     if (is_dir($d) && is_writable($d)) {
         return $d;
@@ -206,8 +221,12 @@ function csrf_token(): string
         return $t;
     }
     $t = '';
-    if (is_readable('/var/local/emhttp/var.ini')) {
-        $var = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
+    $ini = getenv('UZT_VAR_INI');
+    if (!is_string($ini) || $ini === '') {
+        $ini = '/var/local/emhttp/var.ini';
+    }
+    if (is_readable($ini)) {
+        $var = @parse_ini_file($ini) ?: [];
         $t = (string)($var['csrf_token'] ?? '');
     }
     return $t;
@@ -349,6 +368,13 @@ function spawn_worker(array $argv): array
 /** 固定的锁文件路径：不随「谁在跑」变化，避免 web 与 cron 各锁各的 */
 function lock_file(): string
 {
+    $override = getenv('UZT_LOCK_DIR');
+    if (is_string($override) && $override !== '') {
+        $dir = rtrim($override, '/');
+        if (is_dir($dir)) {
+            return $dir . '/' . PLUGIN . '.lock';
+        }
+    }
     $candidates = ['/var/lock/' . PLUGIN . '.lock', sys_get_temp_dir() . '/' . PLUGIN . '.lock'];
     foreach ($candidates as $dir) {
         $d = dirname($dir);

@@ -12,7 +12,7 @@ Link='nav-user'
  *
  * 不做任何 DOM 改写、不覆盖任何宿主插件文件，卸载即恢复原样。
  */
-require_once '/usr/local/emhttp/plugins/unraid.zh.translator/include/util.php';
+require_once __DIR__ . '/include/util.php';
 
 if (!\UZT\Config::bool('ENABLED')) {
     return;

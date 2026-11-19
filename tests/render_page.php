@@ -7,7 +7,10 @@
  */
 declare(strict_types=1);
 
-$pluginDir = '/usr/local/emhttp/plugins/unraid.zh.translator';
+$pluginDir = getenv('UZT_PLUGIN_DIR') ?: '/usr/local/emhttp/plugins/unraid.zh.translator';
+if (!is_dir($pluginDir)) {
+    $pluginDir = dirname(__DIR__) . '/src/usr/local/emhttp/plugins/unraid.zh.translator';
+}
 if (!is_dir($pluginDir)) {
     fwrite(STDERR, "请先安装插件到 {$pluginDir}\n");
     exit(1);
@@ -25,6 +28,10 @@ $check = static function (string $name, bool $cond, string $extra = '') use (&$f
 
 // emhttp 会提供 $var（含 csrf_token）；这里照抄一份
 $var = ['csrf_token' => 'testtoken123', 'version' => '7.2.0', 'NAME' => 'Tower'];
+// CI/本地测试时给 csrf_token() 一个可读的 var.ini（真实 Unraid 上是 /var/local/emhttp/var.ini）
+$varIni = sys_get_temp_dir() . '/uzt-render-var.ini';
+@file_put_contents($varIni, "csrf_token=\"testtoken123\"\n");
+putenv('UZT_VAR_INI=' . $varIni);
 $_SERVER['REQUEST_METHOD'] = 'GET';
 $_SERVER['REQUEST_URI'] = '/Settings/unraid.zh.translator';
 

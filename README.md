@@ -315,11 +315,28 @@ git push                     # 推到 main 后，用户在插件页点「检查�
 ## 13. 开发与测试
 
 ```bash
-./build.sh 2026.11.20      # 生成 dist/unraid.zh.translator.plg（自包含，内联全部文件）
-tests/run-tests.sh         # 全量回归（见下）
+./build.sh 2026.11.25      # 生成 dist/*.plg 与仓库根目录的发布件（自包含，内联全部文件）
+
+# ① 任意机器（含 CI，无需 root、不写系统目录）—— 27 项核心断言
+php tests/core.php
+node tests/norm_parity.mjs && node tests/rules_parity.mjs && node tests/dom.test.mjs
+php tests/policy.php && php tests/render_page.php
+
+# ② 有 Unraid/root 的机器 —— 77 项全量回归（会覆盖安装到 /usr/local/emhttp）
+sudo bash tests/run-tests.sh
 ```
 
-`tests/run-tests.sh`（共 65 项断言）会依次验证：
+代码里所有绝对路径都可以用环境变量重定向，方便在容器/CI 里跑：
+
+| 变量 | 作用 | 生产默认 |
+|---|---|---|
+| `UZT_CFG_DIR` | 配置/词库目录 | `/boot/config/plugins/unraid.zh.translator` |
+| `UZT_VAR_DIR` | 运行期缓存目录 | `/usr/local/emhttp/plugins/…/var`（不可写时回落） |
+| `UZT_LOCK_DIR` | worker 锁文件目录 | `/var/lock` |
+| `UZT_VAR_INI` | csrf_token 来源 | `/var/local/emhttp/var.ini` |
+| `UZT_FAKE_CA_FEED` | 测试用假应用源 | 不设 |
+
+`tests/run-tests.sh`（共 77 项断言）会依次验证：
 
 1. 全部 PHP `php -l`、JS `node --check`
 2. `build.sh` 打包 → 解析 `.plg` → 还原到 `/usr/local/emhttp/...` → **逐字节**比对源码
@@ -349,8 +366,10 @@ src/usr/local/emhttp/plugins/unraid.zh.translator/
   ajax/                                   lookup · status · settings · configjs
   scripts/worker.php                      sync / translate / all / cron / prune / stats / test
   js/                                     uzt-norm.js（规范化）· store-zh.js（替换引擎）
-tests/                                    mock_llm.py · install_plg.py · render_page.php
-                                          norm_parity.mjs · rules_parity.mjs · dom.test.mjs · run-tests.sh
+tests/                                    core.php（无需 root 的核心链路）
+                                          mock_llm.py · install_plg.py · render_page.php · policy.php
+                                          norm_parity.mjs · rules_parity.mjs · dom.test.mjs
+                                          run-tests.sh + steps/（需要 root 的全量回归）
 demo/                                     store.html（模拟商店）+ seed.php + shots/
 ```
 
