@@ -4235,7 +4235,7 @@ if (!\UZT\Config::bool('ENABLED')) {
     return;
 }
 $base = '/plugins/unraid.zh.translator';
-$stamp = (string)@filemtime('/usr/local/emhttp/plugins/unraid.zh.translator/js/store-zh.js');
+$stamp = (string)@filemtime(__DIR__ . '/js/store-zh.js');   // 用 __DIR__：装到哪都能取到
 if ($stamp === '') {
     $stamp = \UZT\VERSION;
 }
