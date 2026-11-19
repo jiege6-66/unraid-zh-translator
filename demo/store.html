@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Apps — 演示页（模拟 Community Applications）</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#1b1b1b; color:#d8d8d8;
+         font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; font-size:14px; }
+  header { background:#111; border-bottom:1px solid #2c2c2c; padding:12px 22px; display:flex; align-items:center; gap:14px; }
+  header h1 { font-size:16px; margin:0; font-weight:600; letter-spacing:.3px; }
+  header .tabs { margin-left:auto; display:flex; gap:6px; }
+  header .tabs a { color:#9a9a9a; text-decoration:none; padding:6px 12px; border-radius:5px; font-size:13px; }
+  header .tabs a.on { background:#ff8c2f; color:#fff; }
+  main { display:grid; grid-template-columns:216px 1fr; gap:18px; padding:18px 22px 40px; }
+  aside { background:#202020; border:1px solid #2c2c2c; border-radius:8px; padding:12px; height:fit-content; }
+  aside h4 { margin:0 0 10px; font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:#7d7d7d; }
+  aside ul { list-style:none; margin:0; padding:0; }
+  aside li { padding:6px 8px; border-radius:5px; color:#bdbdbd; font-size:13px; }
+  aside li:hover { background:#2a2a2a; }
+  aside li.on { background:#333; color:#fff; }
+  section h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:#7d7d7d; margin:0 0 12px; }
+  .card { background:#232323; border:1px solid #2f2f2f; border-radius:9px; padding:16px 18px; margin-bottom:14px; }
+  .card .top { display:flex; gap:14px; align-items:flex-start; }
+  .icon { width:52px; height:52px; border-radius:10px; flex:none;
+          background:linear-gradient(135deg,#2f6efb,#7b3ff2); display:flex; align-items:center; justify-content:center;
+          font-weight:700; color:#fff; font-size:18px; }
+  .card h3 { margin:0 0 4px; font-size:15px; color:#f0f0f0; }
+  .meta { font-size:12px; color:#8d8d8d; }
+  .pill { display:inline-block; border:1px solid #3a3a3a; border-radius:999px; padding:1px 9px; font-size:11px; color:#9d9d9d; margin-right:5px; }
+  .desc { margin-top:10px; line-height:1.62; color:#c7c7c7; }
+  .desc p { margin:0 0 8px; }
+  .requires { margin-top:10px; font-size:13px; color:#a9a9a9; }
+  .requires b { color:#cfcfcf; }
+  .actions { display:flex; gap:8px; margin-top:12px; }
+  .btn { background:#2f2f2f; border:1px solid #3d3d3d; color:#dcdcdc; border-radius:6px; padding:7px 14px; font-size:13px; cursor:pointer; }
+  .btn.primary { background:#ff8c2f; border-color:#ff8c2f; color:#fff; font-weight:600; }
+  .fields { margin-top:12px; border-top:1px dashed #333; padding-top:10px; }
+  .field { display:flex; gap:10px; padding:5px 0; font-size:13px; }
+  .field .k { width:150px; color:#9e9e9e; }
+  .field .v { color:#c9c9c9; }
+  .field input { background:#171717; border:1px solid #3a3a3a; color:#dcdcdc; border-radius:5px; padding:5px 8px; width:230px; }
+  table.plugins { width:100%; border-collapse:collapse; background:#232323; border:1px solid #2f2f2f; border-radius:9px; overflow:hidden; }
+  table.plugins th, table.plugins td { text-align:left; padding:10px 14px; border-bottom:1px solid #2c2c2c; vertical-align:top; font-size:13px; }
+  table.plugins th { background:#1f1f1f; color:#8d8d8d; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  table.plugins td.d { color:#b9b9b9; line-height:1.55; }
+  code { background:#151515; border:1px solid #2c2c2c; border-radius:4px; padding:1px 5px; font-size:12px; color:#8fd3a0; }
+  .note { margin:18px 22px 0; padding:10px 14px; background:#242018; border:1px solid #4a3d22; border-radius:8px; color:#c9b98f; font-size:12px; }
+</style>
+</head>
+<body>
+<!-- 说明：本页模拟 Unraid 的「应用 / Apps」与「插件 / Plugins」界面，用于验证中文替换效果。
+     真实环境里同样的脚本由 store-zh-inject.page 注入到官方 WebUI。 -->
+<header>
+  <h1 id="page-title">Apps</h1>
+  <div class="tabs"><a class="on">应用</a><a>已安装</a><a>设置</a></div>
+</header>
+
+<div id="ca-app" class="ca-app">
+  <main>
+    <aside>
+      <h4>Categories</h4>
+      <ul id="cats">
+        <li class="on">Media Applications</li>
+        <li>Media Servers</li>
+        <li>Downloaders</li>
+        <li>Home Automation</li>
+        <li>Backup</li>
+        <li>Security</li>
+        <li>Network Services</li>
+        <li>Tools / Utilities</li>
+        <li>Productivity</li>
+      </ul>
+    </aside>
+
+    <div class="content">
+      <section>
+        <h2 id="sort-label">Sort by</h2>
+
+        <div class="card">
+          <div class="top">
+            <div class="icon">JF</div>
+            <div style="flex:1">
+              <h3 class="app-name">Jellyfin</h3>
+              <div class="meta"><span class="pill">Media Servers</span><span class="pill">amd64</span></div>
+            </div>
+          </div>
+          <div class="desc" id="desc-jellyfin">
+            <p>Jellyfin is a free software media system that puts you in control of managing and streaming your media.</p>
+            <p>It is an alternative to the proprietary Emby and Plex, to provide media from a dedicated server to end-user devices.</p>
+            <p>This container requires host networking to work correctly.</p>
+            <p>Use the WebUI link to finish the first-run wizard, then add your libraries.</p>
+          </div>
+          <div class="requires"><b>Requires:</b> <span id="req-jellyfin">A valid media library. amd64 or arm64.</span></div>
+          <div class="fields">
+            <div class="field"><div class="k" id="f1k">App Data</div>
+              <div class="v" title="Where Jellyfin stores its database, metadata and transcode cache. Put this on your cache pool.">/mnt/user/appdata/jellyfin</div></div>
+            <div class="field"><div class="k">PUID</div>
+              <div class="v" id="f2d">User ID of the user that will own the media files.</div></div>
+          </div>
+          <div class="actions"><button class="btn primary">Install</button><button class="btn">Change log</button></div>
+        </div>
+
+        <div class="card">
+          <div class="top">
+            <div class="icon">IM</div>
+            <div style="flex:1"><h3 class="app-name">Immich</h3>
+              <div class="meta"><span class="pill">Media Applications</span></div></div>
+          </div>
+          <div class="desc">
+            <p>Immich is a self-hosted photo and video backup solution that works like a private Google Photos.</p>
+            <p>Machine learning features require an Intel, NVIDIA or AMD GPU for the best experience.</p>
+          </div>
+          <div class="requires"><b>Requires:</b>
+            <span id="req-immich">Requires a PostgreSQL database and a Redis instance, both included in this template.</span></div>
+          <div class="fields">
+            <div class="field"><div class="k">PUID</div>
+              <div class="v">User ID of the user that will own the media files.</div></div>
+          </div>
+          <div class="actions"><button class="btn primary">Install</button><button class="btn">Change log</button></div>
+        </div>
+
+        <div class="card">
+          <div class="top">
+            <div class="icon">FR</div>
+            <div style="flex:1"><h3 class="app-name">Frigate</h3>
+              <div class="meta"><span class="pill">Home Automation</span></div></div>
+          </div>
+          <div class="desc">
+            <p>Frigate is an NVR with realtime local object detection for IP cameras.</p>
+            <p>A Coral USB Accelerator or an Intel iGPU is strongly recommended for detection.</p>
+          </div>
+          <div class="actions"><button class="btn primary">Install</button><button class="btn">Change log</button></div>
+        </div>
+
+        <div class="card">
+          <div class="top">
+            <div class="icon">DP</div>
+            <div style="flex:1"><h3 class="app-name">Duplicati</h3>
+              <div class="meta"><span class="pill">Backup</span></div></div>
+          </div>
+          <div class="desc">
+            <p>Duplicati is a backup client that securely stores encrypted, incremental, compressed backups on cloud storage services and remote file servers.</p>
+          </div>
+          <div class="requires"><b>Requires:</b> <span>A backup destination: S3, WebDAV, SFTP or a mounted share.</span></div>
+          <div class="actions"><button class="btn primary">Install</button><button class="btn">Change log</button></div>
+        </div>
+      </section>
+
+      <section style="margin-top:22px">
+        <h2>插件 / Plugins</h2>
+        <table class="plugins">
+          <thead><tr><th>Plugin</th><th>Description</th><th>Version</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><b>Unraid Connect</b><br><span class="meta">by Unraid</span></td>
+              <td class="d">Unraid Connect lets you manage your server remotely and keeps a flash backup in the cloud.
+                <div class="meta" style="margin-top:6px"><b>Change log:</b>
+                  <span>Fixes an issue where the dashboard would not refresh after changing the theme.</span></div>
+              </td>
+              <td>2026.11.01</td>
+            </tr>
+            <tr>
+              <td><b>Vast.ai Monitor</b><br><span class="meta">by 0xntpower</span></td>
+              <td class="d">Adds a dashboard tile for your Vast.ai host machines.
+                <div class="meta" style="margin-top:6px"><b>Change log:</b>
+                  <span>Adds a widget that shows array temperatures and fan speeds.</span></div>
+              </td>
+              <td>2026.05.11</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="meta" style="margin-top:10px">
+          模板字段示例（不应被改动）：<code>PUID=99</code> <code>/mnt/user/appdata/jellyfin</code>
+          <span title="Official">Official</span>
+        </p>
+      </section>
+    </div>
+  </main>
+</div>
+
+<script>
+// 演示用：带 ?lang=en 打开时自动切到英文原文，便于截图对比
+window.addEventListener('load', function () {
+  var m = /[?&]lang=(en|zh)/.exec(location.search);
+  if (m && window.uzt && window.uzt.setLang) {
+    setTimeout(function () { window.uzt.setLang(m[1]); }, 1200);
+  }
+});
+</script>
+<!-- 与 store-zh-inject.page 完全相同的引入顺序 -->
+<script src="/plugins/unraid.zh.translator/ajax/configjs.php?v=demo"></script>
+<script src="/plugins/unraid.zh.translator/js/uzt-norm.js?v=demo"></script>
+<script src="/plugins/unraid.zh.translator/js/store-zh.js?v=demo" defer></script>
+</body>
+</html>

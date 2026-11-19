@@ -1,0 +1,9 @@
+{
+  "name": "uzt-tests",
+  "private": true,
+  "type": "module",
+  "description": "unraid.zh.translator 前端测试（jsdom）",
+  "devDependencies": {
+    "jsdom": "^25.0.1"
+  }
+}

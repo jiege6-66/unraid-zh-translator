@@ -1,0 +1,28 @@
+Menu='Buttons'
+Link='nav-user'
+---
+<?php
+/**
+ * unraid.zh.translator — 全局注入点
+ *
+ * Unraid 的 webGui 会把所有 Menu='Buttons' 的 .page 渲染进顶栏，
+ * 因此这段 PHP 在每一个 WebUI 页面上都会执行 —— 我们只在这里挂两个脚本：
+ *   1) ajax/configjs.php  运行时配置（开关、范围、CSRF）
+ *   2) js/store-zh.js     文本替换引擎（内部会判断当前页面是否需要工作）
+ *
+ * 不做任何 DOM 改写、不覆盖任何宿主插件文件，卸载即恢复原样。
+ */
+require_once '/usr/local/emhttp/plugins/unraid.zh.translator/include/util.php';
+
+if (!\UZT\Config::bool('ENABLED')) {
+    return;
+}
+$base = '/plugins/unraid.zh.translator';
+$stamp = (string)@filemtime('/usr/local/emhttp/plugins/unraid.zh.translator/js/store-zh.js');
+if ($stamp === '') {
+    $stamp = \UZT\VERSION;
+}
+?>
+<script src="<?= $base ?>/ajax/configjs.php?v=<?= $stamp ?>"></script>
+<script src="<?= $base ?>/js/uzt-norm.js?v=<?= $stamp ?>"></script>
+<script src="<?= $base ?>/js/store-zh.js?v=<?= $stamp ?>" defer></script>

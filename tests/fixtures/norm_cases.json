@@ -1,0 +1,41 @@
+{
+  "cases": [
+    "Hello world",
+    "  Hello   world  ",
+    "Hello\r\nWorld",
+    "Hello\rWorld",
+    "line1\n\n\nline2",
+    "line1\n   \nline2",
+    "\t\ttabbed\tline\t",
+    "NBSP here and there",
+    "ideographic　space",
+    "zero​width​and​bom﻿here",
+    "trailing spaces   ",
+    "   leading spaces",
+    "",
+    "   ",
+    "\n\n\n",
+    "Mixed\t tabs \n and\rcarriage",
+    "中文 与 English mixed",
+    "Multi\nline\ntext\nwith\nmany\nlines",
+    "Jellyfin is a free software media system that puts you in control of managing and streaming your media.",
+    "  [IP]:[PORT:8096]  ",
+    "a\nb\nc",
+    "   ",
+    "Requires:",
+    "Change log: ",
+    "amd64",
+    "PUID",
+    "lscr.io/linuxserver/jellyfin:latest",
+    "Video",
+    " Line sep lead",
+    "Trailing line sep ",
+    " Thin space lead",
+    "Unit space",
+    " Figure space",
+    "\fForm feed lead",
+    "Trailing nul\u0000",
+    " Ogham space",
+    "Normal nbsp　ideographic"
+  ]
+}

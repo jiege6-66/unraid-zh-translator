@@ -1,0 +1,87 @@
+{
+  "last_updated": "2026-11-18 15:11",
+  "categories": [
+    { "Cat": "MediaApp:", "Des": "Media Applications", "Sub": [
+        { "Cat": "MediaApp:Video", "Des": "Video" },
+        { "Cat": "MediaApp:Music", "Des": "Music" }
+    ]},
+    { "Cat": "Tools:", "Des": "Tools", "Sub": [
+        { "Cat": "Tools:System", "Des": "System" }
+    ]}
+  ],
+  "applist": [
+    {
+      "Name": "Jellyfin",
+      "Repository": "lscr.io/linuxserver/jellyfin:latest",
+      "Registry": "https://hub.docker.com/r/linuxserver/jellyfin",
+      "Project": "https://jellyfin.org",
+      "Support": "https://forums.unraid.net/topic/1234-jellyfin/",
+      "Category": "MediaApp:Video",
+      "Icon": "https://raw.githubusercontent.com/linuxserver/docker-templates/master/linuxserver.io/img/jellyfin-logo.png",
+      "Overview": "Jellyfin is a free software media system that puts you in control of managing and streaming your media.\n\n    It is an alternative to the proprietary Emby and Plex, to provide media from a dedicated server to end-user devices.\n\n    This container requires host networking to work correctly.\n\n    Use the WebUI link to finish the first-run wizard, then add your libraries.",
+      "Requires": "A valid media library. amd64 or arm64.",
+      "Network": "host",
+      "Date": "2026-09-24",
+      "Config": [
+        {
+          "@attributes": {
+            "Name": "App Data",
+            "Target": "/config",
+            "Description": "Where Jellyfin stores its database, metadata and transcode cache. Put this on your cache pool.",
+            "Type": "Path"
+          },
+          "value": "/mnt/user/appdata/jellyfin"
+        },
+        {
+          "@attributes": {
+            "Name": "PUID",
+            "Target": "PUID",
+            "Description": "User ID of the user that will own the media files.",
+            "Type": "Variable"
+          },
+          "value": "99"
+        }
+      ]
+    },
+    {
+      "Name": "Duplicati",
+      "Repository": "lscr.io/linuxserver/duplicati:latest",
+      "Project": "https://www.duplicati.com",
+      "CategoryList": ["Tools-System", "Backup"],
+      "Overview": "Duplicati is a backup client that securely stores encrypted, incremental, compressed backups on cloud storage services and remote file servers.\n\n    This container requires host networking to work correctly.",
+      "Requires": "A backup destination: S3, WebDAV, SFTP or a mounted share.",
+      "Date": "2026-08-02"
+    },
+    {
+      "Name": "Vast.ai Monitor",
+      "PluginURL": "https://raw.githubusercontent.com/0xntpower/VastAI-Unraid-Widget/main/vastai.plg",
+      "Repository": "https://raw.githubusercontent.com/0xntpower/VastAI-Unraid-Widget/main/vastai.plg",
+      "Project": "https://github.com/0xntpower/VastAI-Unraid-Widget",
+      "Support": "https://forums.unraid.net/topic/200608-plugin-vastai-dashboard-tile/",
+      "Overview": "Adds a dashboard tile for your Vast.ai host machines.\n\n    Shows each machine's rental state, live hourly earnings and GPU temperature with colour thresholds.",
+      "Branch": { "Tag": "main", "TagDescription": "Latest stable release from the author." },
+      "pluginVersion": "2026.05.11",
+      "CategoryList": ["Plugins", "Tools-System"],
+      "Date": "2026-05-11"
+    },
+    {
+      "Name": "中文已翻译示例",
+      "Repository": "example/zh-only:latest",
+      "Overview": "这是一个已经翻译好的中文说明，插件不应该重复处理。",
+      "Date": "2026-01-01"
+    },
+    {
+      "Name": "PreLocalized",
+      "Repository": "example/localized:latest",
+      "Language": "de",
+      "Overview": "Diese Anwendung ist bereits lokalisiert und wird uebersprungen.",
+      "Date": "2026-01-01"
+    },
+    {
+      "Name": "UrlOnly",
+      "Repository": "example/urlonly:latest",
+      "Overview": "https://example.com/docs",
+      "Date": "2026-01-01"
+    }
+  ]
+}

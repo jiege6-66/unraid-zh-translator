@@ -1,0 +1,4752 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name "unraid.zh.translator">
+<!ENTITY author "YG">
+<!ENTITY version "2026.11.19">
+<!ENTITY launch "Settings/unraid.zh.translator">
+<!ENTITY plugdir "/boot/config/plugins/&name;">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/jiege6-66/unraid-zh-translator/main/unraid.zh.translator.plg">
+]>
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" icon="language">
+
+<!-- 插件中文化 (Unraid Store 中文翻译) -->
+<DESCRIPTION>
+把 Community Applications（应用/插件商店）与原生「插件」页面里的英文文案自动翻译为简体中文。
+译文按「文本内容哈希」缓存：插件未更新则复用旧译文、不调用大模型；文案变化（插件更新）时只重译改动的那几段。
+支持任何 OpenAI 兼容接口（OpenAI / DeepSeek / Moonshot / 智谱 / one-api 中转 / 本地 Ollama、LM Studio 等）。
+纯前端替换，不修改任何宿主机文件，卸载即恢复英文。
+</DESCRIPTION>
+<CHANGES>
+### 2026.11.19
+- 应用商店（Community Applications）与已安装插件页面的英文文案自动译为中文
+- 译文按内容哈希缓存：插件未更新则复用译文，文案变化只重译改动片段
+- 支持任何 OpenAI 兼容接口（含本地 Ollama / LM Studio）
+- 设置页可测试连通性、同步应用源、查看覆盖率与日志
+</CHANGES>
+
+<FILE Run="/bin/bash">
+<INLINE>
+# 覆盖式安装：先清掉本体与历史副本，避免插件列表里出现两个同名插件
+rm -rf /usr/local/emhttp/plugins/&name;
+for d in /usr/local/emhttp/plugins/*unraid.zh.translator*; do
+  [ -e "$d" ] || continue
+  if [ "$d" = "/usr/local/emhttp/plugins/&name;" ]; then continue; fi
+  echo "清理旧插件目录: $d"
+  rm -rf "$d"
+done
+for f in /boot/config/plugins/*unraid.zh.translator*.plg; do
+  [ -e "$f" ] || continue
+  if [ "$f" = "/boot/config/plugins/&name;.plg" ]; then continue; fi
+  echo "清理旧 .plg: $f"
+  mv -f "$f" "$f.removed" 2>/dev/null || rm -f "$f"
+done
+mkdir -p /usr/local/emhttp/plugins/&name;
+mkdir -p &plugdir;
+mkdir -p &plugdir;/logs;
+chmod 0770 &plugdir; &plugdir;/logs 2>/dev/null
+[ -w &plugdir; ] || echo "警告：&plugdir; 不可写（/boot 只读或已满），设置将无法保存"
+echo "安装 &name; 2026.11.19"
+</INLINE>
+</FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/ajax/configjs.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * GET /plugins/unraid.zh.translator/config.php.js
+ * 给前端注入运行时配置（含 CSRF token），只在已登录的 WebUI 环境里被访问。
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+require_once __DIR__ . '/../include/translator.php';
+
+// 只允许同源页面取用（CSRF token 不应当被跨站 <script> 拿到）
+$site = $_SERVER['HTTP_SEC_FETCH_SITE'] ?? '';
+if ($site !== '' && !in_array($site, ['same-origin', 'none'], true)) {
+    http_response_code(403);
+    header('Content-Type: application/javascript; charset=utf-8');
+    echo "/* forbidden: cross-site */\n";
+    exit;
+}
+$ref = $_SERVER['HTTP_REFERER'] ?? '';
+if ($site === '' && $ref !== '') {
+    $host = parse_url($ref, PHP_URL_HOST);
+    $self = $_SERVER['HTTP_HOST'] ?? '';
+    if ($host !== null && $self !== '' && strcasecmp($host, (string)parse_url('http://' . $self, PHP_URL_HOST)) !== 0) {
+        http_response_code(403);
+        header('Content-Type: application/javascript; charset=utf-8');
+        echo "/* forbidden: cross-origin referer */\n";
+        exit;
+    }
+}
+
+$cfg = Config::all();
+$base = '/plugins/unraid.zh.translator';
+$payload = [
+    'endpoint' => $base . '/ajax',
+    'csrf' => csrf_token(),
+    'enabled' => Config::bool('ENABLED'),
+    'scope' => $cfg['SCOPE'],
+    'autoNew' => Config::bool('AUTO_NEW'),
+    'syncLookup' => Config::bool('SYNC_ON_LOOKUP'),
+    'version' => VERSION,
+    'debug' => Config::bool('DEBUG'),
+];
+
+if (!headers_sent()) {
+    header('Content-Type: application/javascript; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-Content-Type-Options: nosniff');
+}
+echo 'window.__UZT__ = ' . json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . ";\n";
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/ajax/lookup.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * POST /plugins/unraid.zh.translator/ajax/lookup.php
+ * body: {"texts":["..."],"csrf":"..."}
+ * 返回：{"ok":true,"hits":{原文:译文},"queued":N,"translated_now":N,"rev":"..."}
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+require_once __DIR__ . '/../include/translator.php';
+
+header('Content-Type: application/json; charset=utf-8');
+header('Cache-Control: no-store');
+
+try {
+    if (!Config::bool('ENABLED')) {
+        json_response(['ok' => true, 'hits' => [], 'queued' => 0, 'translated_now' => 0, 'rev' => '0', 'disabled' => true]);
+    }
+    $body = read_json_body();
+    $csrf = $body['csrf'] ?? ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? null);
+    if (!check_csrf(is_string($csrf) ? $csrf : null)) {
+        json_response(['ok' => false, 'error' => 'CSRF 校验失败，请刷新页面'], 403);
+    }
+    $texts = $body['texts'] ?? [];
+    if (!is_array($texts)) {
+        json_response(['ok' => false, 'error' => 'texts 必须是数组'], 400);
+    }
+    $allowSync = isset($body['sync']) ? (bool)$body['sync'] : null;
+    $res = Translator::lookup($texts, $allowSync);
+    json_response(['ok' => true] + $res);
+} catch (\Throwable $e) {
+    jlog('lookup 异常: ' . $e->getMessage(), 'ERROR');
+    json_response(['ok' => false, 'error' => $e->getMessage()], 500);
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/ajax/settings.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * POST /plugins/unraid.zh.translator/ajax/settings.php
+ * body: {"action":"save|test|sync|translate|prune|wipe|defaults|retry-failed","csrf":"...", ...}
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+require_once __DIR__ . '/../include/translator.php';
+
+header('Content-Type: application/json; charset=utf-8');
+header('Cache-Control: no-store');
+
+try {
+    $body = read_json_body();
+    $csrf = $body['csrf'] ?? ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? null);
+    if (!check_csrf(is_string($csrf) ? $csrf : null)) {
+        json_response(['ok' => false, 'error' => 'CSRF 校验失败，请刷新页面后重试'], 403);
+    }
+    $action = (string)($body['action'] ?? '');
+
+    switch ($action) {
+        case 'save':
+            $input = is_array($body['config'] ?? null) ? $body['config'] : [];
+            if (!empty($body['clear_key'])) {
+                $input['API_KEY'] = '__CLEAR__';
+            }
+            $input = Config::mergeMaskedKey($input);
+            $before = Config::all();
+            $errors = Config::save($input);
+            $after = Config::all();
+            if (($before['CRON'] ?? '') !== ($after['CRON'] ?? '')) {
+                self_update_cron($after['CRON']);
+            }
+            $writeFailed = (bool)array_filter($errors, static fn($e) => str_contains((string)$e, '写入失败'));
+            json_response([
+                'ok' => !$writeFailed,
+                'errors' => $errors,
+                'error' => $writeFailed ? '配置未能保存' : '',
+                'config' => Config::public_view(),
+                'cron_changed' => ($before['CRON'] ?? '') !== ($after['CRON'] ?? ''),
+            ]);
+            break;
+
+        case 'test':
+            // 用短超时、不重试：这个动作在 web 请求里同步执行，不能超过 nginx 的 60s
+            $llm = new Llm(['TIMEOUT' => 20, 'RETRIES' => 0]);
+            json_response(['ok' => true, 'result' => $llm->test()]);
+            break;
+
+        case 'sync':
+            $argv = ['sync'];
+            if (!empty($body['force'])) {
+                $argv[] = '--force';
+            }
+            $res = spawn_worker($argv);
+            json_response(['ok' => (bool)$res['ok'], 'spawned' => $res, 'error' => $res['error'] ?? '']);
+            break;
+
+        case 'translate':
+            $seconds = (int)($body['seconds'] ?? Config::int('WORKER_SECONDS', 300));
+            $res = spawn_worker(['translate', '--seconds=' . max(30, min(3600, $seconds))]);
+            json_response(['ok' => (bool)$res['ok'], 'spawned' => $res, 'error' => $res['error'] ?? '']);
+            break;
+
+        case 'prune':
+            // 需要解析 22MB 应用源，必须放到 CLI（web 进程内存受限）
+            $res = spawn_worker(['prune']);
+            json_response(['ok' => (bool)$res['ok'], 'spawned' => $res, 'error' => $res['error'] ?? '']);
+            break;
+
+        case 'wipe':
+            Store::open()->wipe();
+            jlog('用户清空了全部译文缓存', 'WARN');
+            json_response(['ok' => true, 'stats' => Store::open()->stats()]);
+            break;
+
+        case 'drop-pending':
+            json_response(Translator::dropPending());
+            break;
+
+        case 'compact':
+            json_response(Translator::compact((string)($body['scope'] ?? '') === 'all' ? false : null));
+            break;
+
+        case 'retry-failed':
+            $n = Store::open()->resetFailed();
+            Store::open()->flush();
+            jlog('用户把 ' . $n . ' 条失败片段放回队列', 'INFO');
+            json_response(['ok' => true, 'reset' => $n]);
+            break;
+
+        case 'defaults':
+            Config::reset();
+            json_response(['ok' => true, 'config' => Config::public_view()]);
+            break;
+
+        default:
+            json_response(['ok' => false, 'error' => '未知动作: ' . $action], 400);
+    }
+} catch (\Throwable $e) {
+    jlog('settings 异常: ' . $e->getMessage(), 'ERROR');
+    json_response(['ok' => false, 'error' => $e->getMessage()], 500);
+}
+
+/** 写入 dynamix 的 cron 目录并重载 cron */
+function self_update_cron(string $expr): void
+{
+    $file = '/boot/config/plugins/dynamix/unraid.zh.translator.cron';
+    $expr = trim($expr);
+    if ($expr === '') {
+        @unlink($file);
+    } else {
+        $worker = plugin_dir() . '/scripts/worker.php';
+        // 先判存在：插件被卸载后残留的 cron 行不会每天报错
+        $cmd = '[ -f ' . $worker . ' ] && /usr/bin/php -d memory_limit=1024M ' . $worker . ' cron >/dev/null 2>&1';
+        atomic_write($file, "# unraid.zh.translator 定时同步/翻译\n{$expr} {$cmd}\n", 0644);
+    }
+    if (is_file('/usr/local/sbin/update_cron')) {
+        @exec('/usr/local/sbin/update_cron >/dev/null 2>&1');
+    }
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/ajax/status.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * GET /plugins/unraid.zh.translator/ajax/status.php
+ * 返回统计、队列、worker 状态、最近日志，供设置页轮询。
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+require_once __DIR__ . '/../include/translator.php';
+
+header('Content-Type: application/json; charset=utf-8');
+header('Cache-Control: no-store');
+
+try {
+    $store = Store::open();
+    // 轻量模式：只要 rev / 队列 / 运行状态，供页面高频轮询
+    if (!empty($_GET['light'])) {
+        json_response([
+            'ok' => true,
+            'light' => true,
+            'revision' => $store->revision(),
+            'pending' => $store->countPending(),
+            'worker_running' => Translator::workerRunning(),
+        ]);
+    }
+    $logTail = '';
+    $lf = log_file();
+    if (is_readable($lf)) {
+        $lines = file($lf) ?: [];
+        $logTail = implode('', array_slice($lines, -40));
+    }
+    json_response([
+        'ok' => true,
+        'stats' => $store->stats(),
+        'kinds' => $store->kindStats(),
+        'estimate' => Translator::estimate(),
+        'worker_running' => Translator::workerRunning(),
+        'config' => [
+            'ENABLED' => Config::get('ENABLED'),
+            'SCOPE' => Config::get('SCOPE'),
+            'API_KEY_SET' => Config::get('API_KEY') !== '' ? '1' : '0',
+            'MODEL' => Config::get('MODEL'),
+            'API_BASE' => Config::get('API_BASE'),
+            'SYNC_ON_LOOKUP' => Config::get('SYNC_ON_LOOKUP'),
+        ],
+        'meta' => [
+            'synced_at' => $store->getMeta('synced_at'),
+            'feed_updated' => $store->getMeta('feed_updated'),
+            'feed_apps' => $store->getMeta('feed_apps'),
+            'plugins' => $store->getMeta('plugins'),
+        ],
+        'env' => [
+            'php_cli' => php_cli_binary(),
+            'php_sapi' => PHP_SAPI,
+            'php_fpm_binary' => PHP_BINARY,
+            'log_dir' => dirname(log_file()),
+            'log_writable' => is_writable(dirname(log_file())),
+            'boot_writable' => is_writable(cfg_dir()),
+            'var_dir' => var_dir(),
+            'feed_source' => $store->getMeta('feed_source'),
+            'feed_age' => (int)$store->getMeta('feed_age', '0'),
+            'feed_from_local' => $store->getMeta('feed_from_local') === '1',
+            'ca_local' => (static function (): array {
+                $l = SourceFeed::localFeed();
+                return $l ? ['file' => $l['file'], 'age' => time() - $l['mtime']] : [];
+            })(),
+        ],
+        'failures' => $store->failureSummary(3),
+        'recent' => $store->recentEvents(8),
+        'log' => $logTail,
+        'now' => time(),
+    ]);
+} catch (\Throwable $e) {
+    json_response(['ok' => false, 'error' => $e->getMessage()], 500);
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/include/config.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * unraid.zh.translator — 配置读写
+ *
+ * 配置保存在 U 盘 /boot/config/plugins/unraid.zh.translator/translator.cfg，
+ * 格式为 INI，权限 0600（内含 API Key）。
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+final class Config
+{
+    public const FILE = 'translator.cfg';
+
+    /** 默认值 —— 也是 UI 上「恢复默认」的目标 */
+    public const DEFAULTS = [
+        'ENABLED'        => '1',        // 总开关：是否翻译商店/插件页面
+        'SCOPE'          => 'store',    // store | store_plugins | all
+        'AUTO_NEW'       => '1',        // 页面上没见过的英文，是否自动翻译
+        'SYNC_ON_LOOKUP' => '1',        // lookup 时同步翻译（否则入队等后台）
+        'SYNC_MAX_CHARS' => '4000',     // 单次同步翻译的字符上限
+        'HOURLY_CHAR_BUDGET' => '120000', // 每小时同步翻译总字符上限（0=不限），超出则只入队
+        'TARGET'         => 'zh-CN',
+        'API_BASE'       => 'https://api.openai.com/v1',
+        'API_KEY'        => '',
+        'MODEL'          => 'gpt-4o-mini',
+        'JSON_MODE'      => 'auto',     // auto | on | off
+        'TEMPERATURE'    => '0.2',
+        'BATCH_ITEMS'    => '48',
+        'BATCH_CHARS'    => '6000',
+        'TIMEOUT'        => '90',
+        'RETRIES'        => '2',
+        'WORKER_SECONDS' => '300',      // 单次 worker 运行的时间预算
+        'FEED_SOURCE'    => 'auto',     // auto（优先复用 CA 本地缓存）| local | online
+        'FEED_URL'       => 'https://assets.ca.unraid.net/feed/applicationFeed.json',
+        'FEED_CACHE_TTL' => '21600',    // 6 小时，超过则重新下载
+        'CRON'           => '',         // 留空=关闭；例：0 4 * * *
+        'SKIP_NAMES'     => '1',        // 不翻译应用名称（品牌名）
+        'LIVE_MIN_CHARS' => '40',       // 页面即时采集只收「简介级」长文本（约一句话以上）
+        'MAX_TRIES'      => '8',        // 单条片段最多尝试次数（失败按指数退避重排）
+        'AUTO_CONTINUE'  => '1',        // 达到时间预算且队列未清空时，自动接着跑
+        'MAX_CHAIN'      => '40',       // 自动续跑的最大链长（防止无限自启）
+        'PHP_CLI'        => '',         // 留空=自动探测；特殊环境可手填 /usr/bin/php
+        'DEBUG'          => '0',
+    ];
+
+    private static ?array $cache = null;
+
+    public static function file(): string
+    {
+        return cfg_dir() . '/' . self::FILE;
+    }
+
+    public static function all(): array
+    {
+        if (self::$cache !== null) {
+            return self::$cache;
+        }
+        $cfg = self::DEFAULTS;
+        $file = self::file();
+        if (is_readable($file)) {
+            $parsed = @parse_ini_file($file, false, INI_SCANNER_RAW);
+            if ($parsed === false) {
+                jlog('配置文件解析失败（已使用默认值）: ' . $file, 'WARN');
+            }
+            if (is_array($parsed)) {
+                foreach ($parsed as $k => $v) {
+                    if (array_key_exists($k, self::DEFAULTS)) {
+                        $cfg[$k] = is_string($v) ? $v : (string)$v;
+                    }
+                }
+            }
+        }
+        self::$cache = $cfg;
+        return $cfg;
+    }
+
+    public static function get(string $key, ?string $default = null): string
+    {
+        $all = self::all();
+        return $all[$key] ?? ($default ?? (self::DEFAULTS[$key] ?? ''));
+    }
+
+    public static function int(string $key, int $default = 0): int
+    {
+        $v = self::get($key);
+        return $v === '' ? $default : (int)$v;
+    }
+
+    public static function bool(string $key): bool
+    {
+        $v = strtolower(trim(self::get($key)));
+        return $v === '1' || $v === 'true' || $v === 'yes' || $v === 'on';
+    }
+
+    public static function float(string $key, float $default = 0.0): float
+    {
+        $v = trim(self::get($key));
+        return $v === '' ? $default : (float)$v;
+    }
+
+    /** 只接受白名单键，非法值回落默认 */
+    public static function save(array $input): array
+    {
+        $new = self::all();
+        $errors = [];
+        foreach ($input as $k => $v) {
+            if (!array_key_exists($k, self::DEFAULTS)) {
+                continue;
+            }
+            if (!is_scalar($v)) {
+                continue;
+            }
+            $v = (string)$v;
+            switch ($k) {
+                case 'SCOPE':
+                    if (!in_array($v, ['store', 'store_plugins', 'all'], true)) {
+                        $v = self::DEFAULTS['SCOPE'];
+                    }
+                    break;
+                case 'FEED_SOURCE':
+                    if (!in_array($v, ['auto', 'local', 'online'], true)) {
+                        $v = self::DEFAULTS['FEED_SOURCE'];
+                    }
+                    break;
+                case 'JSON_MODE':
+                    if (!in_array($v, ['auto', 'on', 'off'], true)) {
+                        $v = self::DEFAULTS['JSON_MODE'];
+                    }
+                    break;
+                case 'API_BASE':
+                    $v = rtrim(trim($v), '/');
+                    if ($v !== '' && !preg_match('#^https?://#i', $v)) {
+                        $errors[] = 'API 地址必须以 http:// 或 https:// 开头';
+                        $v = self::DEFAULTS['API_BASE'];
+                    }
+                    break;
+                case 'TEMPERATURE':
+                    $f = (float)$v;
+                    if ($f < 0 || $f > 2) {
+                        $errors[] = '温度需在 0~2 之间，已回落 0.2';
+                        $f = 0.2;
+                    }
+                    $v = (string)$f;
+                    break;
+                case 'BATCH_ITEMS':
+                case 'BATCH_CHARS':
+                case 'TIMEOUT':
+                case 'RETRIES':
+                case 'WORKER_SECONDS':
+                case 'FEED_CACHE_TTL':
+                case 'SYNC_MAX_CHARS':
+                case 'HOURLY_CHAR_BUDGET':
+                case 'LIVE_MIN_CHARS':
+                case 'MAX_TRIES':
+                case 'MAX_CHAIN':
+                    $i = (int)$v;
+                    if ($i < 1) {
+                        $i = (int)self::DEFAULTS[$k];
+                    }
+                    if ($k === 'BATCH_ITEMS' && $i > 64) {
+                        $i = 64;
+                    }
+                    if ($k === 'BATCH_CHARS' && $i > 60000) {
+                        $i = 60000;
+                    }
+                    if ($k === 'TIMEOUT' && $i > 600) {
+                        $i = 600;
+                    }
+                    if ($k === 'HOURLY_CHAR_BUDGET' && $i > 10000000) {
+                        $i = 10000000;
+                    }
+                    $v = (string)$i;
+                    break;
+                case 'CRON':
+                    $v = trim(preg_replace('/\s+/', ' ', $v) ?? '');
+                    // 只允许 5 段、且每段只含 0-9 * / , - —— 避免把换行等注入 crontab 文件
+                    if ($v !== '' && !preg_match('#^[0-9*,/-]+(?: [0-9*,/-]+){4}$#', $v)) {
+                        $errors[] = 'Cron 需为 5 段格式（分 时 日 月 周，只含数字 * , / -），已忽略';
+                        $v = '';
+                    }
+                    break;
+                case 'API_KEY':
+                    $v = trim($v);
+                    break;
+                case 'ENABLED':
+                case 'AUTO_CONTINUE':
+                case 'AUTO_NEW':
+                case 'SYNC_ON_LOOKUP':
+                case 'SKIP_NAMES':
+                case 'DEBUG':
+                    $v = ($v === '1' || strtolower($v) === 'true') ? '1' : '0';
+                    break;
+                default:
+                    $v = trim($v);
+            }
+            $new[$k] = $v;
+        }
+        if (!self::write($new)) {
+            $errors[] = '配置写入失败：' . self::file() . ' 不可写（/boot 只读、已满或权限问题），设置未生效';
+        }
+        self::$cache = null;
+        return $errors;
+    }
+
+    public static function write(array $cfg): bool
+    {
+        $lines = ["; unraid.zh.translator 配置 — 由 WebUI 生成，可直接编辑", '; ' . date('c')];
+        foreach (self::DEFAULTS as $k => $def) {
+            $v = (string)($cfg[$k] ?? $def);
+            $v = str_replace(["\r", "\n"], '', $v);
+            $v = str_replace(['\\', '"'], ['\\\\', '\\"'], $v);
+            $lines[] = $k . '="' . $v . '"';
+        }
+        return atomic_write(self::file(), implode("\n", $lines) . "\n", 0600);
+    }
+
+    /** 给浏览器的配置视图（打码敏感字段） */
+    public static function public_view(): array
+    {
+        $cfg = self::all();
+        $key = $cfg['API_KEY'];
+        $masked = '';
+        if ($key !== '') {
+            $masked = mb_strlen($key) <= 8 ? '****' : mb_substr($key, 0, 4) . '****' . mb_substr($key, -4);
+        }
+        $cfg['API_KEY'] = $masked;
+        $cfg['API_KEY_SET'] = $key !== '' ? '1' : '0';
+        $cfg['_version'] = VERSION;
+        return $cfg;
+    }
+
+    public static function reset(): void
+    {
+        @unlink(self::file());
+        self::$cache = null;
+    }
+
+    /** 记住 API Key 是否真的被改过：UI 回传掩码时保留原值 */
+    public static function mergeMaskedKey(array $input): array
+    {
+        if (($input['API_KEY'] ?? '') === '__CLEAR__') {
+            $input['API_KEY'] = '';       // 用户勾选「清除已保存的密钥」
+            return $input;
+        }
+        unset($input['__CLEAR__']);
+        if (isset($input['API_KEY'])) {
+            $v = (string)$input['API_KEY'];
+            if ($v === '' || str_contains($v, '****')) {
+                unset($input['API_KEY']);   // 留空/掩码 = 不修改
+            }
+        }
+        return $input;
+    }
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/include/llm.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * unraid.zh.translator — 大模型翻译客户端（OpenAI 兼容 /chat/completions）
+ *
+ * 兼容：OpenAI、DeepSeek、Moonshot、智谱、硅基流动、one-api、Ollama(/v1)、
+ * LM Studio、vLLM、OpenRouter 等一切实现 /v1/chat/completions 的服务。
+ *
+ * 设计要点：
+ *  - 批量：一次请求塞多条短文本，省钱省时（BATCH_ITEMS / BATCH_CHARS）；
+ *  - 长段落：先在句末切块，再分别翻译后拼回；
+ *  - 严格校验：条数、非空、必须含中文、长度比例、换行数量；
+ *  - 失败重试：传输错误指数退避，格式错误带「修复提示」再试一次。
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+final class Llm
+{
+    public const PROMPT_VERSION = '2026-11-19.1';
+
+    private string $base;
+    private string $key;
+    private string $model;
+    private string $jsonMode;
+    private float $temperature;
+    private int $batchItems;
+    private int $batchChars;
+    private int $timeout;
+    private int $retries;
+    private string $target;
+
+    public $lastError = '';
+    public $lastRaw = '';
+    public $calls = 0;
+    public $units = 0;
+    public $msTotal = 0.0;   // 累计 HTTP 往返耗时，用于预估剩余时间
+
+    /** @param array{TIMEOUT?:int,RETRIES?:int} $overrides */
+    public function __construct(array $overrides = [])
+    {
+        $this->base = rtrim(Config::get('API_BASE'), '/');
+        $this->key = Config::get('API_KEY');
+        $this->model = Config::get('MODEL');
+        $this->jsonMode = Config::get('JSON_MODE');
+        $this->temperature = Config::float('TEMPERATURE', 0.2);
+        $this->batchItems = max(1, Config::int('BATCH_ITEMS', 16));
+        $this->batchChars = max(500, Config::int('BATCH_CHARS', 5000));
+        $this->timeout = max(5, (int)($overrides['TIMEOUT'] ?? Config::int('TIMEOUT', 90)));
+        $this->retries = max(0, (int)($overrides['RETRIES'] ?? Config::int('RETRIES', 2)));
+        $this->target = Config::get('TARGET', 'zh-CN') ?: 'zh-CN';
+    }
+
+    public function ready(): bool
+    {
+        return $this->base !== '' && $this->model !== '';
+    }
+
+    public function describe(): string
+    {
+        return sprintf('%s @ %s', $this->model, $this->base);
+    }
+
+    // ------------------------------------------------------------------ 对外
+
+    /**
+     * @param array<int,array{h:string,src:string}> $items
+     * @return array{hits: array<string,string>, errors: array<string,string>}
+     */
+    public function translateBatch(array $items): array
+    {
+        $hits = [];
+        $errors = [];
+        if (!$items) {
+            return ['hits' => $hits, 'errors' => $errors];
+        }
+        if (!$this->ready()) {
+            $msg = '未配置 API 地址或模型';
+            foreach ($items as $it) {
+                $errors[$it['h']] = $msg;
+            }
+            return ['hits' => $hits, 'errors' => $errors];
+        }
+
+        // 1) 展开成翻译单元（长文本按句切块）
+        $units = [];       // id => src
+        $parent = [];      // id => h
+        $pieceTotal = [];  // h => 需要几片
+        foreach ($items as $it) {
+            $pieces = self::splitForTranslation($it['src'], (int)max(800, $this->batchChars * 0.6));
+            $pieceTotal[$it['h']] = count($pieces);
+            if (count($pieces) === 1) {
+                $units[$it['h']] = $pieces[0];
+                $parent[$it['h']] = $it['h'];
+            } else {
+                foreach ($pieces as $i => $p) {
+                    $id = $it['h'] . '~' . $i;
+                    $units[$id] = $p;
+                    $parent[$id] = $it['h'];
+                }
+            }
+        }
+        $this->units += count($units);
+
+        // 2) 组批执行。注意：同一原文的多片可能被分到**不同批次**，
+        //    所以累积器必须在批循环之外，否则只会留下最后一片的译文。
+        $acc = [];   // h => [片号 => 译文]
+        foreach (self::packBatches($units, $this->batchItems, $this->batchChars) as $batch) {
+            $res = $this->runBatch($batch);
+            if (isset($res['error'])) {
+                foreach ($batch as $id => $_) {
+                    $errors[$parent[$id]] = $res['error'];
+                }
+                continue;
+            }
+            foreach ($batch as $id => $_) {
+                $h = $parent[$id];
+                $idx = 0;
+                $pos = strrpos($id, '~');
+                if ($pos !== false) {
+                    $idx = (int)substr($id, $pos + 1);
+                }
+                if (!isset($res['t'][$id]) || $res['t'][$id] === '') {
+                    $errors[$h] = $errors[$h] ?? '模型未返回该条译文';
+                    continue;
+                }
+                $acc[$h][$idx] = $res['t'][$id];
+            }
+        }
+
+        // 3) 只有「所有片都到齐」才成稿；缺片宁可报错，也不把残稿写进缓存
+        foreach ($pieceTotal as $h => $n) {
+            if (isset($errors[$h])) {
+                continue;
+            }
+            if (!isset($acc[$h]) || count($acc[$h]) !== $n) {
+                $errors[$h] = '分片译文不完整';
+                continue;
+            }
+            ksort($acc[$h]);
+            $hits[$h] = implode(' ', $acc[$h]);
+        }
+
+        return ['hits' => $hits, 'errors' => $errors];
+    }
+
+    // ------------------------------------------------------------------ 组批
+
+    /**
+     * @param array<string,string> $units
+     * @return array<int,array<string,string>>
+     */
+    private static function packBatches(array $units, int $maxItems, int $maxChars): array
+    {
+        $batches = [];
+        $cur = [];
+        $chars = 0;
+        foreach ($units as $id => $src) {
+            $len = mb_strlen($src, 'UTF-8');
+            if ($cur && (count($cur) >= $maxItems || $chars + $len > $maxChars)) {
+                $batches[] = $cur;
+                $cur = [];
+                $chars = 0;
+            }
+            $cur[$id] = $src;
+            $chars += $len;
+            if ($len >= $maxChars) {
+                $batches[] = $cur;
+                $cur = [];
+                $chars = 0;
+            }
+        }
+        if ($cur) {
+            $batches[] = $cur;
+        }
+        return $batches;
+    }
+
+    /** 按句末切分，尽量不破坏占位符与列表结构 */
+    public static function splitForTranslation(string $text, int $max = 2400): array
+    {
+        $len = mb_strlen($text, 'UTF-8');
+        if ($len <= $max) {
+            return [$text];
+        }
+        $sentences = preg_split('/(?<=[.!?:;])\s+/u', $text) ?: [$text];
+        $out = [];
+        $buf = '';
+        foreach ($sentences as $s) {
+            $candidate = $buf === '' ? $s : $buf . ' ' . $s;
+            if (mb_strlen($candidate, 'UTF-8') > $max && $buf !== '') {
+                $out[] = $buf;
+                $buf = $s;
+            } else {
+                $buf = $candidate;
+            }
+        }
+        if ($buf !== '') {
+            $out[] = $buf;
+        }
+        // 极端情况：单句超长，硬切
+        $final = [];
+        foreach ($out as $chunk) {
+            if (mb_strlen($chunk, 'UTF-8') <= $max) {
+                $final[] = $chunk;
+                continue;
+            }
+            $total = mb_strlen($chunk, 'UTF-8');
+            for ($off = 0; $off < $total; $off += $max) {
+                $final[] = mb_substr($chunk, $off, $max, 'UTF-8');
+            }
+        }
+        return $final;
+    }
+
+    // ------------------------------------------------------------------ 单次请求
+
+    /** @param array<string,string> $batch */
+    private function runBatch(array $batch): array
+    {
+        $payload = [];
+        foreach ($batch as $id => $src) {
+            $payload[] = ['i' => (string)$id, 's' => $src];
+        }
+        $messages = [
+            ['role' => 'system', 'content' => $this->systemPrompt()],
+            ['role' => 'user', 'content' => json_encode(
+                ['task' => 'translate', 'target' => $this->target, 'items' => $payload],
+                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+            )],
+        ];
+
+        $attempt = 0;
+        $repair = '';
+        while (true) {
+            $msgs = $messages;
+            if ($repair !== '') {
+                $msgs[] = ['role' => 'assistant', 'content' => $this->lastRaw];
+                $msgs[] = ['role' => 'user', 'content' => $repair];
+            }
+            $res = $this->request($msgs);
+            if (isset($res['error'])) {
+                $this->lastError = $res['error'];
+                if ($attempt < $this->retries && self::retryable($res['error'])) {
+                    $attempt++;
+                    $sleep = (int)min(20, 2 ** $attempt);
+                    jlog(sprintf('LLM 请求失败(%s)，%d 秒后重试 #%d', $res['error'], $sleep, $attempt), 'WARN');
+                    sleep($sleep);
+                    continue;
+                }
+                return ['error' => $res['error']];
+            }
+            $this->lastRaw = $res['content'];
+            $decoded = self::extractJson($res['content']);
+            if ($decoded === null) {
+                if ($attempt < 1) {
+                    $attempt++;
+                    $repair = '你的上一条回复不是合法 JSON 或缺少 t 字段。请只输出 JSON：{"t":{"<id>":"<译文>"}}，并覆盖全部 id，不要输出任何解释文字。';
+                    continue;
+                }
+                return ['error' => '模型返回内容无法解析为 JSON'];
+            }
+            $checked = $this->validate($batch, $decoded);
+            if ($checked['missing']) {
+                if ($attempt < 1) {
+                    $attempt++;
+                    $repair = '以下 id 缺失或译文不合格：' . implode(',', array_slice($checked['missing'], 0, 20))
+                        . '。请补全，并且只输出 JSON：{"t":{"<id>":"<译文>"}}。';
+                    continue;
+                }
+            }
+            if (!$checked['t']) {
+                return ['error' => '模型返回的译文全部未通过校验'];
+            }
+            return ['t' => $checked['t']];
+        }
+    }
+
+    /**
+     * @param array<string,string> $batch
+     * @param array<string,string> $decoded
+     * @return array{t:array<string,string>, missing:array<int,string>}
+     */
+    private function validate(array $batch, array $decoded): array
+    {
+        $ok = [];
+        $missing = [];
+        foreach ($batch as $id => $src) {
+            $dst = isset($decoded[$id]) ? trim((string)$decoded[$id]) : '';
+            if ($dst === '') {
+                $missing[] = (string)$id;
+                continue;
+            }
+            if ($dst === $src) {
+                // 系统提示词要求品牌名保持原样，模型对单词条目合法地返回原文。
+                // 这种情况视为「已完成（保留原文）」，否则会 repair 重试两次后永久失败。
+                if (!preg_match('/\s/', $src)) {
+                    $ok[$id] = $dst;
+                    continue;
+                }
+                $missing[] = (string)$id;
+                continue;
+            }
+            if (!has_cjk($dst)) {
+                $missing[] = (string)$id;
+                continue;
+            }
+            $sl = mb_strlen($src, 'UTF-8');
+            $dl = mb_strlen($dst, 'UTF-8');
+            if ($sl > 24 && $dl < $sl * 0.10) {
+                $missing[] = (string)$id;
+                continue;
+            }
+            if ($sl > 24 && $dl > $sl * 6) {
+                $missing[] = (string)$id;
+                continue;
+            }
+            $ok[$id] = $dst;
+        }
+        return ['t' => $ok, 'missing' => $missing];
+    }
+
+    private static function retryable(string $err): bool
+    {
+        if (preg_match('/^HTTP\s+(408|409|425|429|500|502|503|504)\b/', $err)) {
+            return true;
+        }
+        return (bool)preg_match('/timeout|timed out|Could not resolve|Connection refused|SSL|Empty reply/i', $err);
+    }
+
+    public static function extractJson(string $content): ?array
+    {
+        $content = trim($content);
+        if ($content === '') {
+            return null;
+        }
+        $try = function (string $s): ?array {
+            $d = json_decode($s, true);
+            if (!is_array($d)) {
+                return null;
+            }
+            if (isset($d['t']) && is_array($d['t'])) {
+                return self::flattenT($d['t']);
+            }
+            // 兼容 {"translations":{"id":"..."}} / {"1":"..."} 之类
+            foreach (['translations', 'result', 'results', 'data'] as $k) {
+                if (isset($d[$k]) && is_array($d[$k])) {
+                    return self::flattenT($d[$k]);
+                }
+            }
+            return self::flattenT($d);
+        };
+        $direct = $try($content);
+        if ($direct !== null) {
+            return $direct;
+        }
+        if (preg_match('/```(?:json)?\s*(.+?)```/si', $content, $m)) {
+            $r = $try(trim($m[1]));
+            if ($r !== null) {
+                return $r;
+            }
+        }
+        $start = strpos($content, '{');
+        $end = strrpos($content, '}');
+        if ($start !== false && $end !== false && $end > $start) {
+            return $try(substr($content, $start, $end - $start + 1));
+        }
+        return null;
+    }
+
+    private static function flattenT(array $in): array
+    {
+        $out = [];
+        foreach ($in as $k => $v) {
+            if (is_string($v)) {
+                $out[(string)$k] = $v;
+            } elseif (is_array($v)) {
+                foreach (['text', 'zh', 'translation', 'dst', 's'] as $kk) {
+                    if (isset($v[$kk]) && is_string($v[$kk])) {
+                        $out[(string)$k] = $v[$kk];
+                        break;
+                    }
+                }
+            }
+        }
+        return $out;
+    }
+
+    // ------------------------------------------------------------------ HTTP
+
+    private function systemPrompt(): string
+    {
+        return <<<TXT
+你是 Unraid 社区应用商店（Community Applications）与技术文档的专业本地化译者。把英文文案翻译成简体中文。
+
+必须遵守：
+1. 只输出 JSON：{"t":{"<id>":"<译文>"}}。id 原样回填，覆盖输入里的每一个 id，不增不减。不要输出解释、注释或 Markdown 代码围栏。
+2. 以下内容保持原样不翻译：产品/应用名、公司名、作者名、容器镜像名与 tag、URL、域名、文件路径、命令行参数（--xxx）、环境变量名（PUID、TZ、UMASK）、端口/占位符（[IP]、[PORT:8080]、{{...}}）、版本号、许可证名、型号与单位符号、代码片段、Markdown/HTML 标签与链接地址。
+3. 保留原文的换行与段落结构；原文一个段落对应译文一个段落。
+4. 术语统一：container=容器，appdata=应用数据目录，array=阵列，share=共享文件夹，pool=存储池，parity=校验盘，template=模板，host network=主机网络，bridge=桥接网络，reverse proxy=反向代理，plugin=插件，WebUI=Web 界面，dashboard=仪表盘，pass-through=直通，mount=挂载，snapshot=快照，cache=缓存。
+5. 语体：技术文档口吻，简洁、准确、信息完整；不省略、不扩写、不加评论、不加拼音。
+6. 译文里不要出现 "翻译"、"原文" 之类的自指词。
+TXT;
+    }
+
+    /** @return array{content?:string,error?:string} */
+    private function request(array $messages): array
+    {
+        $t0 = microtime(true);
+        $this->calls++;
+        try {
+            return $this->requestOnce($messages);
+        } finally {
+            $this->msTotal += (microtime(true) - $t0) * 1000;
+        }
+    }
+
+    /** @return array{content?:string,error?:string} */
+    private function requestOnce(array $messages): array
+    {
+        $url = $this->base . '/chat/completions';
+        $body = [
+            'model' => $this->model,
+            'messages' => $messages,
+            'temperature' => $this->temperature,
+            'stream' => false,
+        ];
+        if ($this->jsonMode === 'on' || $this->jsonMode === 'auto') {
+            $body['response_format'] = ['type' => 'json_object'];
+        }
+        $res = self::curlJson($url, $body, $this->key, $this->timeout);
+        if (isset($res['error']) && $this->jsonMode === 'auto'
+            && preg_match('/response_format|json_object|json mode/i', (string)$res['error'])) {
+            unset($body['response_format']);
+            $res = self::curlJson($url, $body, $this->key, $this->timeout);
+        }
+        if (isset($res['error'])) {
+            return $res;
+        }
+        $data = $res['data'];
+        $content = '';
+        if (isset($data['choices'][0]['message']['content'])) {
+            $c = $data['choices'][0]['message']['content'];
+            if (is_string($c)) {
+                $content = $c;
+            } elseif (is_array($c)) {
+                foreach ($c as $part) {
+                    if (is_array($part) && isset($part['text'])) {
+                        $content .= $part['text'];
+                    }
+                }
+            }
+        } elseif (isset($data['choices'][0]['text'])) {
+            $content = (string)$data['choices'][0]['text'];
+        } elseif (isset($data['message']['content'])) { // 兼容 ollama 原生 /api/chat
+            $content = (string)$data['message']['content'];
+        }
+        if (trim($content) === '') {
+            $msg = $data['error']['message'] ?? '模型返回为空';
+            return ['error' => mb_substr((string)$msg, 0, 300)];
+        }
+        return ['content' => $content];
+    }
+
+    /** @return array{data?:array,error?:string} */
+    public static function curlJson(string $url, array $body, string $key = '', int $timeout = 90): array
+    {
+        $payload = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($payload === false) {
+            return ['error' => '请求体编码失败'];
+        }
+        $headers = ['Content-Type: application/json', 'Accept: application/json'];
+        if ($key !== '') {
+            $headers[] = 'Authorization: Bearer ' . $key;
+        }
+        if (!function_exists('curl_init')) {
+            return ['error' => 'PHP 缺少 curl 扩展'];
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_USERAGENT => 'unraid.zh.translator/' . VERSION,
+        ]);
+        $raw = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $err = curl_error($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+
+        if ($errno !== 0) {
+            return ['error' => 'HTTP ' . $errno . ' ' . $err];
+        }
+        $data = json_decode((string)$raw, true);
+        if ($code >= 400) {
+            $msg = 'HTTP ' . $code;
+            if (is_array($data)) {
+                $detail = $data['error']['message'] ?? $data['error'] ?? $data['message'] ?? '';
+                if (is_array($detail)) {
+                    $detail = json_encode($detail, JSON_UNESCAPED_UNICODE);
+                }
+                if ($detail) {
+                    $msg .= ' ' . mb_substr((string)$detail, 0, 240);
+                }
+            } else {
+                $msg .= ' ' . mb_substr(trim((string)$raw), 0, 200);
+            }
+            return ['error' => $msg];
+        }
+        if (!is_array($data)) {
+            return ['error' => '响应不是 JSON: ' . mb_substr(trim((string)$raw), 0, 160)];
+        }
+        return ['data' => $data];
+    }
+
+    /** 连通性自测 */
+    public function test(): array
+    {
+        if (!$this->ready()) {
+            return ['ok' => false, 'error' => '请先填写 API 地址与模型名'];
+        }
+        $t0 = microtime(true);
+        $src = 'Adds a dashboard tile with live GPU temperature, and requires host networking.';
+        $res = $this->translateBatch([['h' => 'selftest', 'src' => $src]]);
+        $ms = (int)round((microtime(true) - $t0) * 1000);
+        if (isset($res['hits']['selftest'])) {
+            return [
+                'ok' => true,
+                'ms' => $ms,
+                'model' => $this->model,
+                'base' => $this->base,
+                'sample_src' => $src,
+                'sample_dst' => $res['hits']['selftest'],
+            ];
+        }
+        return [
+            'ok' => false,
+            'ms' => $ms,
+            'model' => $this->model,
+            'base' => $this->base,
+            'error' => $res['errors']['selftest'] ?? ($this->lastError ?: '未知错误'),
+        ];
+    }
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/include/source_feed.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * unraid.zh.translator — Community Applications 数据源
+ *
+ * 从 CA 的应用源（applicationFeed.json，约 22MB / 5000+ 应用）里抽出
+ * 真正需要翻译的文案片段：应用简介、所需条件、分类名、模板字段说明、分支说明。
+ *
+ * 抽出的每条片段都用「规范化文本的 sha1」做键：
+ * 文案不变 => 命中缓存；文案变化（插件更新）=> 新键 => 自动重译。
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+final class SourceFeed
+{
+    /** 小于这个字节数视为空文件/半截下载（真正的校验靠 applist 字段和 JSON 解析） */
+    private const MIN_FEED_BYTES = 2048;
+
+    /** 片段类型 → 用于统计展示 */
+    public const KIND_LABEL = [
+        'overview'  => '应用简介',
+        'requires'  => '运行要求',
+        'cat'       => '分类名称',
+        'field'     => '模板字段说明',
+        'fieldname' => '模板字段名',
+        'branch'    => '分支说明',
+        'note'      => '应用备注',
+        'localdesc' => '本地插件描述',
+        'localchg'  => '本地插件更新日志',
+    ];
+
+    /** 我们自己下载后的缓存（在线源才会用） */
+    public static function cacheFile(): string
+    {
+        return var_dir() . '/applicationFeed.json';
+    }
+
+    /** 官方 CDN（CA 插件自己用的主源） */
+    public const URL_PRIMARY = 'https://assets.ca.unraid.net/feed/applicationFeed.json';
+    /** GitHub 备份源（与上面同内容） */
+    public const URL_BACKUP = 'https://raw.githubusercontent.com/Squidly271/AppFeed/master/applicationFeed.json';
+    /** 只有 37 字节的「源更新时间」戳，用来零成本判断本地缓存是否最新 */
+    public const URL_STAMP = 'https://assets.ca.unraid.net/feed/applicationFeed-lastUpdated.json';
+
+    /**
+     * CA 插件把下载好的应用源解压到这里（见 CA 的 include/paths.php:
+     * 'application-feed-local' => "/tmp/GitHub/AppFeed/applicationFeed.json"）。
+     * 直接复用它，既省 22MB 下载，又和商店里显示的内容完全一致。
+     */
+    public static function localCandidates(): array
+    {
+        $list = [
+            '/tmp/GitHub/AppFeed/applicationFeed.json',
+            '/tmp/community.applications/AppFeed/applicationFeed.json',
+            '/tmp/community.applications/tempFiles/applicationFeed.json',
+            '/tmp/community.applications/applicationFeed.json',
+        ];
+        foreach (glob('/tmp/*/AppFeed/applicationFeed.json') ?: [] as $g) {
+            $list[] = $g;
+        }
+        return array_values(array_unique(array_filter($list)));
+    }
+
+    /** @return array{file:string,mtime:int,size:int,stamp:int}|null 最新的一个本地 CA 缓存 */
+    public static function localFeed(): ?array
+    {
+        $best = null;
+        foreach (self::localCandidates() as $f) {
+            if (!is_file($f) || filesize($f) < self::MIN_FEED_BYTES) {
+                continue;
+            }
+            $head = (string)@file_get_contents($f, false, null, 0, 65536);
+            if (!str_contains($head, '"applist"') && !str_contains($head, '"apps"')) {
+                continue;
+            }
+            clearstatcache(true, $f);
+            $mtime = (int)filemtime($f);
+            if ($best === null || $mtime > $best['mtime']) {
+                $best = [
+                    'file' => $f,
+                    'mtime' => $mtime,
+                    'size' => (int)filesize($f),
+                    'stamp' => preg_match('/"last_updated_timestamp"\s*:\s*(\d+)/', $head, $m) ? (int)$m[1] : 0,
+                ];
+            }
+        }
+        return $best;
+    }
+
+    /** 官方「源更新时间」戳（37 字节，失败返回 0） */
+    public static function remoteStamp(int $timeout = 8): int
+    {
+        $res = self::curlGet(self::URL_STAMP, 4096, $timeout);
+        if ($res !== null && preg_match('/"last_updated_timestamp"\s*:\s*(\d+)/', $res, $m)) {
+            return (int)$m[1];
+        }
+        return 0;
+    }
+
+    private static function curlGet(string $url, int $maxBytes, int $timeout): ?string
+    {
+        if (!function_exists('curl_init')) {
+            return null;
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_USERAGENT => 'unraid.zh.translator/' . VERSION,
+            CURLOPT_ENCODING => '',
+        ]);
+        $body = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        if (!is_string($body) || $code !== 200 || strlen($body) > $maxBytes) {
+            return null;
+        }
+        return $body;
+    }
+
+    /**
+     * 取应用源：优先复用 CA 本地缓存，必要时才下载。
+     *
+     * FEED_SOURCE=auto  （默认）本地缓存够新就用，否则下载
+     * FEED_SOURCE=local 只用 CA 本地缓存（离线/省流量），没有就报错
+     * FEED_SOURCE=online 只下载（放到我们的 var 缓存里）
+     *
+     * @return array{ok:bool,file?:string,error?:string,fresh?:bool,source?:string,stamp?:int,age?:int,from_local?:bool}
+     */
+    public static function fetch(bool $force = false, ?callable $log = null): array
+    {
+        $mode = strtolower(trim(Config::get('FEED_SOURCE', 'auto'))) ?: 'auto';
+        $ttl = max(600, Config::int('FEED_CACHE_TTL', 21600));
+        $say = function (string $m) use ($log): void {
+            if ($log) {
+                $log($m);
+            }
+        };
+        $local = self::localFeed();
+        $ownCache = self::cacheFile();
+        $hasOwn = is_file($ownCache) && filesize($ownCache) >= self::MIN_FEED_BYTES;
+
+        // 1) 只用本地
+        if ($mode === 'local') {
+            if ($local) {
+                $say('使用 CA 本地应用源: ' . $local['file']);
+                return [
+                    'ok' => true, 'file' => $local['file'], 'fresh' => false, 'source' => 'ca-local',
+                    'stamp' => $local['stamp'], 'age' => time() - $local['mtime'], 'from_local' => true,
+                ];
+            }
+            return ['ok' => false, 'error' => '未找到 CA 本地应用源：请先在 WebUI 打开一次「应用 / Apps」页面，或把应用源切换为「自动」'];
+        }
+
+        // 2) 本地缓存是否最新：拿 37 字节的时间戳比对，避免白下 22MB
+        if (!$force && $mode === 'auto' && $local) {
+            $age = time() - $local['mtime'];
+            if ($age <= $ttl) {
+                $say('使用 CA 本地应用源（' . human_age($age) . '前）: ' . $local['file']);
+                return [
+                    'ok' => true, 'file' => $local['file'], 'fresh' => true, 'source' => 'ca-local',
+                    'stamp' => $local['stamp'], 'age' => $age, 'from_local' => true,
+                ];
+            }
+            $remote = self::remoteStamp();
+            if ($remote > 0 && $local['stamp'] > 0 && $remote === $local['stamp']) {
+                $say('CA 本地应用源已是最新（时间戳一致），无需下载');
+                return [
+                    'ok' => true, 'file' => $local['file'], 'fresh' => true, 'source' => 'ca-local',
+                    'stamp' => $local['stamp'], 'age' => $age, 'from_local' => true,
+                ];
+            }
+        }
+
+        // 3) 下载（官方 CDN → GitHub 备份）
+        $urls = array_values(array_unique(array_filter([
+            Config::get('FEED_URL'),
+            self::URL_PRIMARY,
+            self::URL_BACKUP,
+        ])));
+        foreach ($urls as $url) {
+            $res = self::download($url, $ownCache, $say);
+            if ($res === null) {
+                continue;
+            }
+            return [
+                'ok' => true, 'file' => $ownCache, 'fresh' => true,
+                'source' => str_contains($url, 'assets.ca.unraid.net') ? 'cdn' : (str_contains($url, 'githubusercontent') ? 'github' : 'custom'),
+                'stamp' => $res, 'age' => 0, 'from_local' => false,
+            ];
+        }
+
+        // 4) 下载失败：退回可用的旧数据
+        if ($local) {
+            $say('下载失败，退回 CA 本地应用源');
+            return [
+                'ok' => true, 'file' => $local['file'], 'fresh' => false, 'source' => 'ca-local',
+                'stamp' => $local['stamp'], 'age' => time() - $local['mtime'], 'from_local' => true,
+                'stale' => true,
+            ];
+        }
+        if ($hasOwn) {
+            $say('下载失败，使用上次的缓存（可能已过期）');
+            return [
+                'ok' => true, 'file' => $ownCache, 'fresh' => false, 'source' => 'own-cache',
+                'stamp' => 0, 'age' => time() - (int)filemtime($ownCache), 'from_local' => false, 'stale' => true,
+            ];
+        }
+        return ['ok' => false, 'error' => '无法获取应用源：本地没有 CA 缓存，在线下载也失败了'];
+    }
+
+    /** @return int|null 成功返回源时间戳 */
+    private static function download(string $url, string $cache, ?callable $say = null): ?int
+    {
+        $tmp = $cache . '.part';
+        $fp = @fopen($tmp, 'wb');
+        if (!$fp) {
+            return null;
+        }
+        if ($say) {
+            $say('下载应用源: ' . $url);
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_FILE => $fp,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 5,
+            CURLOPT_CONNECTTIMEOUT => 20,
+            CURLOPT_TIMEOUT => 300,
+            CURLOPT_USERAGENT => 'unraid.zh.translator/' . VERSION,
+            CURLOPT_ENCODING => '',
+        ]);
+        $ok = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
+        fclose($fp);
+        if (!$ok || $code !== 200 || filesize($tmp) < self::MIN_FEED_BYTES) {
+            jlog(sprintf('应用源下载失败 %s => HTTP %d %s', $url, $code, $err), 'WARN');
+            @unlink($tmp);
+            return null;
+        }
+        $head = (string)@file_get_contents($tmp, false, null, 0, 65536);
+        if (!str_contains($head, '"applist"') && !str_contains($head, '"apps"')) {
+            jlog('应用源内容不是预期格式: ' . $url, 'WARN');
+            @unlink($tmp);
+            return null;
+        }
+        if (!@rename($tmp, $cache)) {
+            @unlink($tmp);
+            return null;
+        }
+        $stamp = preg_match('/"last_updated_timestamp"\s*:\s*(\d+)/', $head, $m) ? (int)$m[1] : 0;
+        return $stamp;
+    }
+
+    /**
+     * 解析应用源并抽出待译片段。
+     *
+     * @return array{ok:bool,error?:string,segments?:array,apps?:array,meta?:array}
+     */
+    public static function extract(?string $file = null, ?callable $progress = null): array
+    {
+        $file = $file ?: self::cacheFile();
+        if (!is_file($file)) {
+            return ['ok' => false, 'error' => '应用源文件不存在: ' . $file];
+        }
+        $raw = file_get_contents($file);
+        if ($raw === false || $raw === '') {
+            return ['ok' => false, 'error' => '应用源为空'];
+        }
+        $data = json_decode($raw, true);
+        unset($raw);
+        if (!is_array($data)) {
+            return ['ok' => false, 'error' => '应用源 JSON 解析失败'];
+        }
+        $apps = $data['applist'] ?? ($data['apps'] ?? null);
+        if (!is_array($apps)) {
+            return ['ok' => false, 'error' => '应用源缺少 applist 字段'];
+        }
+        if ($progress) {
+            $progress(sprintf('解析完成：%d 个应用', count($apps)));
+        }
+
+        $segs = [];        // hash => [src, kind, app]
+        $appRows = [];
+        $skipNames = Config::bool('SKIP_NAMES');
+
+        // ---- 分类树（侧边栏/筛选器里的文字）
+        $catNodes = $data['categories'] ?? [];
+        $walkCat = function ($nodes) use (&$walkCat, &$segs) {
+            if (!is_array($nodes)) {
+                return;
+            }
+            foreach ($nodes as $n) {
+                if (!is_array($n)) {
+                    continue;
+                }
+                foreach (['Des', 'Name'] as $f) {
+                    if (isset($n[$f]) && is_string($n[$f])) {
+                        $h = self::addSeg($segs, $n[$f], 'cat', '');
+                        unset($h);
+                    }
+                }
+                if (isset($n['Sub'])) {
+                    $walkCat($n['Sub']);
+                }
+            }
+        };
+        $walkCat($catNodes);
+
+        // ---- 逐个应用
+        $i = 0;
+        foreach ($apps as $app) {
+            $i++;
+            if (!is_array($app)) {
+                continue;
+            }
+            // 应用源里带 Language 标记的条目本身已是本地化版本，跳过
+            if (isset($app['Language']) && $app['Language'] !== '') {
+                continue;
+            }
+            if ($progress && $i % 1000 === 0) {
+                $progress(sprintf('已处理 %d/%d 个应用，片段 %d', $i, count($apps), count($segs)));
+            }
+            $key = self::appKey($app);
+            $name = (string)($app['Name'] ?? ($app['PluginName'] ?? $key));
+            $isPlugin = self::isPlugin($app);
+            $ver = (string)($app['pluginVersion'] ?? ($app['Version'] ?? ($app['Branch']['Tag'] ?? '')));
+            $nseg = 0;
+
+            $take = function (string $text, string $kind, bool $multi = true) use (&$segs, $key, &$nseg) {
+                $parts = $multi ? self::paragraphs($text) : [normalize_text($text)];
+                foreach ($parts as $p) {
+                    if (self::addSeg($segs, $p, $kind, $key) === null) {
+                        continue;
+                    }
+                    $nseg++;
+                }
+            };
+
+            if (!$skipNames && isset($app['Name'])) {
+                $take((string)$app['Name'], 'overview', false);
+            }
+            if (isset($app['Overview']) && is_string($app['Overview'])) {
+                $take($app['Overview'], 'overview');
+            }
+            if (isset($app['Requires']) && is_string($app['Requires'])) {
+                $take($app['Requires'], 'requires');
+            }
+            if (isset($app['Branch']['TagDescription']) && is_string($app['Branch']['TagDescription'])) {
+                $take($app['Branch']['TagDescription'], 'branch');
+            }
+            foreach (['CAComment', 'ModeratorComment'] as $f) {
+                if (isset($app[$f]) && is_string($app[$f])) {
+                    $take($app[$f], 'note');
+                }
+            }
+            if (isset($app['Config']) && is_array($app['Config'])) {
+                foreach ($app['Config'] as $c) {
+                    if (!is_array($c)) {
+                        continue;
+                    }
+                    $attr = $c['@attributes'] ?? [];
+                    if (!is_array($attr)) {
+                        continue;
+                    }
+                    if (isset($attr['Description']) && is_string($attr['Description'])) {
+                        $take($attr['Description'], 'field');
+                    }
+                    if (isset($attr['Name']) && is_string($attr['Name'])) {
+                        $take($attr['Name'], 'fieldname', false);
+                    }
+                }
+            }
+
+            $appRows[] = [
+                'key' => $key,
+                'name' => mb_substr($name, 0, 160),
+                'kind' => $isPlugin ? 'plugin' : 'docker',
+                'ver' => mb_substr($ver, 0, 60),
+                'nseg' => $nseg,
+                'ndone' => 0,
+            ];
+        }
+
+        $rows = [];
+        foreach ($segs as $h => $s) {
+            $rows[] = ['h' => $h, 'src' => $s[0], 'kind' => $s[1], 'app' => $s[2]];
+        }
+        $meta = [
+            'feed_updated' => (string)($data['last_updated'] ?? ''),
+            'feed_apps' => count($apps),
+            'feed_repositories' => is_array($data['repositories'] ?? null) ? count($data['repositories']) : 0,
+            'feed_ts' => is_file($file) ? (int)filemtime($file) : time(),
+        ];
+        return ['ok' => true, 'segments' => $rows, 'apps' => $appRows, 'meta' => $meta];
+    }
+
+    /** 长文本按空行/换行切成段落 */
+    public static function paragraphs(string $text): array
+    {
+        $norm = normalize_text($text);
+        if ($norm === '') {
+            return [];
+        }
+        $out = [];
+        foreach (preg_split('/\n{1,}/u', $norm) ?: [] as $line) {
+            $line = trim($line);
+            if (is_translatable($line)) {
+                $out[] = $line;
+            }
+        }
+        return $out;
+    }
+
+    /** @return string|null 返回 hash；不可译或重复时返回 null */
+    public static function addSeg(array &$segs, string $text, string $kind, string $app): ?string
+    {
+        if (!is_translatable($text)) {
+            return null;
+        }
+        $norm = normalize_text($text);
+        $h = segment_hash($norm);
+        if (isset($segs[$h])) {
+            return null;
+        }
+        $segs[$h] = [$norm, $kind, $app];
+        return $h;
+    }
+
+    public static function appKey(array $app): string
+    {
+        foreach (['Repository', 'PluginURL', 'Project', 'Name'] as $f) {
+            if (isset($app[$f]) && is_string($app[$f]) && trim($app[$f]) !== '') {
+                return mb_substr(trim($app[$f]), 0, 250);
+            }
+        }
+        return 'unknown-' . substr(sha1(json_encode($app) ?: ''), 0, 12);
+    }
+
+    public static function isPlugin(array $app): bool
+    {
+        if (isset($app['Plugin']) && $app['Plugin']) {
+            return true;
+        }
+        $repo = (string)($app['Repository'] ?? '');
+        $url = (string)($app['PluginURL'] ?? '');
+        return str_ends_with(strtolower($repo), '.plg') || str_ends_with(strtolower($url), '.plg');
+    }
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/include/source_local.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * unraid.zh.translator — 已安装插件（原生「插件」页面）文案预热
+ *
+ * 原生 /Plugins 页面的描述来自 /boot/config/plugins/*.plg 里的
+ * <DESCRIPTION> 与 <CHANGES>。这里把它们也抽成片段做预热；
+ * 即使漏掉也没关系——页面上的英文会被 lookup 按需补译。
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+final class SourceLocal
+{
+    public static function pluginGlob(): string
+    {
+        return '/boot/config/plugins/*.plg';
+    }
+
+    /**
+     * @return array{ok:bool,segments:array,apps:array,meta:array,error?:string}
+     */
+    public static function extract(): array
+    {
+        $files = glob(self::pluginGlob()) ?: [];
+        sort($files);
+        $segs = [];
+        $apps = [];
+        $seenNames = [];
+
+        foreach ($files as $file) {
+            $raw = @file_get_contents($file);
+            if ($raw === false) {
+                continue;
+            }
+            $name = self::attr($raw, 'name') ?: basename($file, '.plg');
+            if (isset($seenNames[$name])) {
+                continue; // 同一个插件可能同时存在 -dev / 备份文件
+            }
+            $seenNames[$name] = true;
+            $version = self::attr($raw, 'version');
+            $nseg = 0;
+
+            $desc = self::block($raw, 'DESCRIPTION');
+            foreach (SourceFeed::paragraphs($desc) as $p) {
+                if (SourceFeed::addSeg($segs, $p, 'localdesc', $name) !== null) {
+                    $nseg++;
+                }
+            }
+            $changes = self::block($raw, 'CHANGES');
+            foreach (SourceFeed::paragraphs($changes) as $p) {
+                // 更新日志里的版本号行不送翻译
+                if (preg_match('/^[\d.\-–\s]+$/', $p)) {
+                    continue;
+                }
+                if (SourceFeed::addSeg($segs, $p, 'localchg', $name) !== null) {
+                    $nseg++;
+                }
+            }
+            $apps[] = [
+                'key' => 'plg:' . $name,
+                'name' => mb_substr((string)$name, 0, 160),
+                'kind' => 'local',
+                'ver' => mb_substr($version, 0, 60),
+                'nseg' => $nseg,
+                'ndone' => 0,
+            ];
+        }
+
+        $rows = [];
+        foreach ($segs as $h => $s) {
+            $rows[] = ['h' => $h, 'src' => $s[0], 'kind' => $s[1], 'app' => $s[2]];
+        }
+        return [
+            'ok' => true,
+            'segments' => $rows,
+            'apps' => $apps,
+            'meta' => ['plugins' => count($apps), 'files' => count($files)],
+        ];
+    }
+
+    private static function attr(string $xml, string $attr): string
+    {
+        if (preg_match('/<PLUGIN\b[^>]*\b' . preg_quote($attr, '/') . '\s*=\s*"([^"]*)"/i', $xml, $m)) {
+            return trim(html_entity_decode($m[1], ENT_QUOTES | ENT_XML1, 'UTF-8'));
+        }
+        return '';
+    }
+
+    private static function block(string $xml, string $tag): string
+    {
+        if (!preg_match('/<' . $tag . '\b[^>]*>(.*?)<\/' . $tag . '>/is', $xml, $m)) {
+            return '';
+        }
+        $inner = $m[1];
+        // 去掉 CDATA 包裹
+        if (preg_match('/<!\[CDATA\[(.*?)\]\]>/s', $inner, $c)) {
+            $inner = $c[1];
+        }
+        $inner = preg_replace('#<br\s*/?>#i', "\n", $inner) ?? $inner;
+        $inner = strip_tags($inner);
+        return html_entity_decode($inner, ENT_QUOTES | ENT_XML1, 'UTF-8');
+    }
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/include/store.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * unraid.zh.translator — 翻译缓存
+ *
+ * 缓存以「规范化文本的 sha1」为主键：
+ *   - 同一段英文（即使出现在不同应用里）只翻译一次；
+ *   - 插件/应用更新导致文案改变 => hash 改变 => 自动重译；
+ *   - 文案没变 => hash 命中 => 直接复用，不调用大模型。
+ *
+ * 主后端 SQLite（增量写入，对 U 盘友好）；若 PHP 未编译 pdo_sqlite，
+ * 退化到 var（RAM）里的 JSON 存储并在 flush() 时镜像到 /boot。
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+final class Store
+{
+    private const SCHEMA = [
+        'CREATE TABLE IF NOT EXISTS seg (
+            h     TEXT PRIMARY KEY,
+            src   TEXT NOT NULL,
+            kind  TEXT NOT NULL DEFAULT "",
+            app   TEXT NOT NULL DEFAULT "",
+            dst   TEXT,
+            st    INTEGER NOT NULL DEFAULT 0,
+            tries INTEGER NOT NULL DEFAULT 0,
+            err   TEXT NOT NULL DEFAULT "",
+            ts    INTEGER NOT NULL DEFAULT 0
+        )',
+        'CREATE INDEX IF NOT EXISTS seg_st ON seg(st, ts)',
+        'CREATE INDEX IF NOT EXISTS seg_app ON seg(app)',
+        'CREATE TABLE IF NOT EXISTS app (
+            key   TEXT PRIMARY KEY,
+            name  TEXT NOT NULL DEFAULT "",
+            kind  TEXT NOT NULL DEFAULT "",
+            ver   TEXT NOT NULL DEFAULT "",
+            nseg  INTEGER NOT NULL DEFAULT 0,
+            ndone INTEGER NOT NULL DEFAULT 0,
+            ts    INTEGER NOT NULL DEFAULT 0
+        )',
+        'CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL DEFAULT "")',
+        'CREATE TABLE IF NOT EXISTS hist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            ev TEXT NOT NULL,
+            n  INTEGER NOT NULL DEFAULT 0
+        )',
+    ];
+
+    /** 失败退避：2^tries × 60 秒，最长 6 小时；超过 MAX_TRIES 才彻底放弃 */
+    private static function retryDelay(int $tries): int
+    {
+        return (int)min(21600, 60 * (2 ** max(1, min(10, $tries))));
+    }
+
+    private static ?Store $inst = null;
+
+    private ?\PDO $pdo = null;
+    private array $mem = ['seg' => [], 'app' => [], 'meta' => []];
+    private bool $dirty = false;
+    private string $backend = 'json';
+
+    public function backend(): string
+    {
+        return $this->backend;
+    }
+
+    public static function dbFile(): string
+    {
+        return cfg_dir() . '/translations.db';
+    }
+
+    public static function memFile(): string
+    {
+        return var_dir() . '/store.json';
+    }
+
+    public static function open(): Store
+    {
+        if (self::$inst instanceof Store) {
+            return self::$inst;
+        }
+        $s = new Store();
+        $dir = cfg_dir();
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0770, true);
+        }
+        if (class_exists('\PDO') && in_array('sqlite', \PDO::getAvailableDrivers(), true)) {
+            try {
+                $s->pdo = $s->openSqlite();
+                $s->backend = 'sqlite';
+                self::$inst = $s;
+                return $s;
+            } catch (\Throwable $e) {
+                // 库文件损坏（掉电/中断）：挪到一边后重建，译文可重新生成
+                $db = self::dbFile();
+                if (is_file($db) && !is_file($db . '.corrupt')) {
+                    jlog('SQLite 打开失败，隔离旧库并重建: ' . $e->getMessage(), 'WARN');
+                    @rename($db, $db . '.corrupt');
+                    @unlink($db . '-journal');
+                    @unlink($db . '.corrupt');
+                    @unlink($db . '-wal');
+                    try {
+                        $s->pdo = $s->openSqlite();
+                        $s->backend = 'sqlite';
+                        self::$inst = $s;
+                        return $s;
+                    } catch (\Throwable $e2) {
+                        jlog('重建 SQLite 仍失败，退化到 JSON 存储: ' . $e2->getMessage(), 'WARN');
+                    }
+                } else {
+                    jlog('SQLite 不可用，退化到 JSON 存储: ' . $e->getMessage(), 'WARN');
+                }
+            }
+        }
+        $s->loadMem();
+        self::$inst = $s;
+        return $s;
+    }
+
+    private function openSqlite(): \PDO
+    {
+        $pdo = new \PDO('sqlite:' . self::dbFile());
+        $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+        $pdo->setAttribute(\PDO::ATTR_DEFAULT_FETCH_MODE, \PDO::FETCH_ASSOC);
+        // 词库放在 U 盘（可能掉电）：用回滚日志 + 完整同步，掉电后能自动回滚，
+        // 而不是像 MEMORY 日志那样留下半写的库（只能整库重建 = 全部重译）。
+        $pdo->exec('PRAGMA journal_mode=DELETE');
+        $pdo->exec('PRAGMA synchronous=FULL');
+        $pdo->exec('PRAGMA busy_timeout=10000');
+        foreach (self::SCHEMA as $sql) {
+            $pdo->exec($sql);
+        }
+        return $pdo;
+    }
+
+    // ---------------------------------------------------------------- JSON 后端
+
+    private function loadMem(): void
+    {
+        $file = self::memFile();
+        $data = null;
+        if (is_readable($file)) {
+            $data = json_decode((string)file_get_contents($file), true);
+        }
+        if (!is_array($data) && is_readable(cfg_dir() . '/store.json')) {
+            $data = json_decode((string)file_get_contents(cfg_dir() . '/store.json'), true);
+        }
+        if (is_array($data)) {
+            $this->mem = [
+                'seg'  => is_array($data['seg'] ?? null) ? $data['seg'] : [],
+                'app'  => is_array($data['app'] ?? null) ? $data['app'] : [],
+                'meta' => is_array($data['meta'] ?? null) ? $data['meta'] : [],
+            ];
+        }
+    }
+
+    public function flush(): void
+    {
+        if ($this->backend !== 'json' || !$this->dirty) {
+            return;
+        }
+        $json = json_encode($this->mem, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($json === false) {
+            return;
+        }
+        atomic_write(self::memFile(), $json);
+        atomic_write(cfg_dir() . '/store.json', $json);
+        $this->dirty = false;
+    }
+
+    public function close(): void
+    {
+        $this->flush();
+        $this->pdo = null;
+    }
+
+    // ---------------------------------------------------------------- 写入
+
+    /**
+     * SQLite 在多标签页/后台任务并发写入时可能短暂 BUSY，这里做有限重试。
+     * @param callable():mixed $fn
+     */
+    private function withRetry(callable $fn)
+    {
+        $attempt = 0;
+        while (true) {
+            try {
+                return $fn();
+            } catch (\Throwable $e) {
+                $busy = stripos($e->getMessage(), 'locked') !== false
+                    || stripos($e->getMessage(), 'busy') !== false;
+                if (!$busy || $attempt >= 3) {
+                    throw $e;
+                }
+                $attempt++;
+                usleep(120000 * $attempt);
+            }
+        }
+    }
+
+    /**
+     * @param array<int,array{h:string,src:string,kind:string,app:string}> $rows
+     * @param bool $insertOnly true 时只做 INSERT OR IGNORE（lookup 路径用，避免对已存在行空写）
+     */
+    public function upsertSegments(array $rows, bool $insertOnly = false): array
+    {
+        $added = 0;
+        $existed = 0;
+        if ($this->backend === 'sqlite') {
+            if (!$rows) {
+                return ['added' => 0, 'existed' => 0];
+            }
+            $this->withRetry(function () use ($rows, $insertOnly, &$added, &$existed): void {
+                $iAdded = 0;
+                $iExisted = 0;
+                $this->pdo->beginTransaction();
+                try {
+                    $now = time();
+                    $ins = $this->pdo->prepare(
+                        'INSERT OR IGNORE INTO seg (h, src, kind, app, dst, st, ts) VALUES (?, ?, ?, ?, NULL, 0, ?)'
+                    );
+                    if ($insertOnly) {
+                        foreach ($rows as $r) {
+                            $ins->execute([$r['h'], $r['src'], (string)($r['kind'] ?? ''), (string)($r['app'] ?? ''), $now]);
+                            $iAdded += $ins->rowCount();
+                        }
+                    } else {
+                        $sel = $this->pdo->prepare('SELECT 1 FROM seg WHERE h = ?');
+                        $upd = $this->pdo->prepare('UPDATE seg SET kind = ?, app = ? WHERE h = ? AND (kind <> ? OR app <> ?)');
+                        foreach ($rows as $r) {
+                            $h = $r['h'];
+                            $kind = (string)($r['kind'] ?? '');
+                            $app = (string)($r['app'] ?? '');
+                            $sel->execute([$h]);
+                            if ($sel->fetchColumn()) {
+                                $upd->execute([$kind, $app, $h, $kind, $app]);
+                                $iExisted++;
+                            } else {
+                                $ins->execute([$h, $r['src'], $kind, $app, $now]);
+                                $iAdded += $ins->rowCount();
+                            }
+                        }
+                    }
+                    $this->pdo->commit();
+                    $added = $iAdded;
+                    $existed = $iExisted;
+                } catch (\Throwable $e) {
+                    if ($this->pdo->inTransaction()) {
+                        $this->pdo->rollBack();
+                    }
+                    throw $e;
+                }
+            });
+            if ($insertOnly) {
+                $existed = count($rows) - $added;
+            }
+            return ['added' => $added, 'existed' => $existed];
+        }
+        foreach ($rows as $r) {
+            $h = $r['h'];
+            if (isset($this->mem['seg'][$h])) {
+                $existed++;
+                continue;
+            }
+            $this->mem['seg'][$h] = [
+                'src' => $r['src'], 'kind' => (string)($r['kind'] ?? ''),
+                'app' => (string)($r['app'] ?? ''), 'dst' => null, 'st' => 0,
+                'tries' => 0, 'err' => '', 'ts' => time(),
+            ];
+            $added++;
+            $this->dirty = true;
+        }
+        return ['added' => $added, 'existed' => $existed];
+    }
+
+    /** @param array<int,array{h:string,dst:string}> $rows */
+    public function setDone(array $rows): int
+    {
+        if (!$rows) {
+            return 0;
+        }
+        $n = 0;
+        if ($this->backend === 'sqlite') {
+            $this->withRetry(function () use ($rows, &$n): void {
+                $iN = 0;
+                $this->pdo->beginTransaction();
+                try {
+                    $st = $this->pdo->prepare('UPDATE seg SET dst = ?, st = 1, err = "", ts = ? WHERE h = ?');
+                    $now = time();
+                    foreach ($rows as $r) {
+                        $st->execute([$r['dst'], $now, $r['h']]);
+                        $iN += $st->rowCount();
+                    }
+                    $this->pdo->commit();
+                    $n = $iN;
+                } catch (\Throwable $e) {
+                    if ($this->pdo->inTransaction()) {
+                        $this->pdo->rollBack();
+                    }
+                    throw $e;
+                }
+            });
+        } else {
+            foreach ($rows as $r) {
+                if (!isset($this->mem['seg'][$r['h']])) {
+                    continue;
+                }
+                $this->mem['seg'][$r['h']]['dst'] = $r['dst'];
+                $this->mem['seg'][$r['h']]['st'] = 1;
+                $this->mem['seg'][$r['h']]['err'] = '';
+                $this->mem['seg'][$r['h']]['ts'] = time();
+                $n++;
+            }
+            $this->dirty = $n > 0;
+        }
+        if ($n > 0) {
+            $this->bumpRevision();
+        }
+        return $n;
+    }
+
+    public function setFail(string $h, string $err): void
+    {
+        $err = mb_substr($err, 0, 400);
+        if ($this->backend === 'sqlite') {
+            $st = $this->pdo->prepare('UPDATE seg SET st = 2, tries = tries + 1, err = ?, ts = ? WHERE h = ?');
+            $st->execute([$err, time(), $h]);
+            return;
+        }
+        if (isset($this->mem['seg'][$h])) {
+            $s = &$this->mem['seg'][$h];
+            $s['st'] = 2;
+            $s['tries'] = (int)$s['tries'] + 1;
+            $s['err'] = $err;
+            $s['ts'] = time();
+            $this->dirty = true;
+        }
+    }
+
+    // ---------------------------------------------------------------- 读取
+
+    /** @return array<string,array{src:string,dst:?string,st:int,tries:int,err:string}> */
+    public function getByHashes(array $hashes): array
+    {
+        $out = [];
+        if (!$hashes) {
+            return $out;
+        }
+        if ($this->backend === 'sqlite') {
+            foreach (array_chunk($hashes, 400) as $chunk) {
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $st = $this->pdo->prepare("SELECT h, src, dst, st, tries, err FROM seg WHERE h IN ($ph)");
+                $st->execute($chunk);
+                foreach ($st->fetchAll() as $row) {
+                    $out[$row['h']] = $row;
+                }
+            }
+            return $out;
+        }
+        foreach ($hashes as $h) {
+            if (isset($this->mem['seg'][$h])) {
+                $out[$h] = ['h' => $h] + $this->mem['seg'][$h];
+            }
+        }
+        return $out;
+    }
+
+    /** @return array<int,array{h:string,src:string,kind:string,app:string,tries:int}> */
+    public function pending(int $limit = 200): array
+    {
+        $limit = max(1, min(5000, $limit));
+        if ($this->backend === 'sqlite') {
+            $maxTries = max(1, Config::int('MAX_TRIES', 8));
+            $rows = $this->pdo->query(
+                'SELECT h, src, kind, app, tries, st, ts FROM seg
+                 WHERE st = 0 OR st = 2 ORDER BY ts ASC LIMIT ' . max(200, $limit * 4)
+            )->fetchAll();
+            $out = [];
+            $now = time();
+            foreach ($rows as $r) {
+                if ((int)$r['st'] === 0) {
+                    $out[] = $r;
+                } elseif ((int)$r['tries'] < $maxTries && $now - (int)$r['ts'] >= self::retryDelay((int)$r['tries'])) {
+                    $out[] = $r;
+                }
+                if (count($out) >= $limit) {
+                    break;
+                }
+            }
+            return $out;
+        }
+        $rows = [];
+        $maxTries = max(1, Config::int('MAX_TRIES', 8));
+        foreach ($this->mem['seg'] as $h => $s) {
+            $retryable = $s['st'] === 2
+                && (int)$s['tries'] < $maxTries
+                && time() - (int)$s['ts'] >= self::retryDelay((int)$s['tries']);
+            if ($s['st'] === 0 || $retryable) {
+                $rows[] = ['h' => $h, 'src' => $s['src'], 'kind' => $s['kind'], 'app' => $s['app'], 'tries' => (int)$s['tries']];
+            }
+        }
+        usort($rows, fn($a, $b) => ($this->mem['seg'][$a['h']]['ts'] ?? 0) <=> ($this->mem['seg'][$b['h']]['ts'] ?? 0));
+        return array_slice($rows, 0, $limit);
+    }
+
+    public function countPending(): int
+    {
+        if ($this->backend === 'sqlite') {
+            $maxTries = max(1, Config::int('MAX_TRIES', 8));
+            $pending = (int)$this->pdo->query('SELECT COUNT(*) FROM seg WHERE st = 0')->fetchColumn();
+            $failed = (int)$this->pdo->query('SELECT COUNT(*) FROM seg WHERE st = 2 AND tries < ' . $maxTries)->fetchColumn();
+            return $pending + $failed;
+        }
+        $n = 0;
+        $maxTries = max(1, Config::int('MAX_TRIES', 8));
+        foreach ($this->mem['seg'] as $s) {
+            if ($s['st'] === 0 || ($s['st'] === 2 && (int)$s['tries'] < $maxTries)) {
+                $n++;
+            }
+        }
+        return $n;
+    }
+
+    public function stats(): array
+    {
+        if ($this->backend === 'sqlite') {
+            $q = fn(string $sql) => (int)$this->pdo->query($sql)->fetchColumn();
+            $total = $q('SELECT COUNT(*) FROM seg');
+            $done = $q('SELECT COUNT(*) FROM seg WHERE st = 1');
+            $fail = $q('SELECT COUNT(*) FROM seg WHERE st = 2');
+            $chars = (int)($this->pdo->query("SELECT COALESCE(SUM(LENGTH(src)),0) FROM seg WHERE st = 1")->fetchColumn() ?: 0);
+            $apps = $q('SELECT COUNT(*) FROM app');
+            $last = (string)($this->pdo->query("SELECT COALESCE(MAX(ts),0) FROM seg WHERE st = 1")->fetchColumn() ?: 0);
+        } else {
+            $total = count($this->mem['seg']);
+            $done = 0;
+            $fail = 0;
+            $chars = 0;
+            $last = 0;
+            foreach ($this->mem['seg'] as $s) {
+                if ($s['st'] === 1) {
+                    $done++;
+                    $chars += mb_strlen($s['src'], 'UTF-8');
+                    $last = max($last, (int)$s['ts']);
+                } elseif ($s['st'] === 2) {
+                    $fail++;
+                }
+            }
+            $apps = count($this->mem['app']);
+        }
+        return [
+            'backend'  => $this->backend,
+            'total'    => $total,
+            'done'     => $done,
+            'pending'  => $this->countPending(),
+            'failed'   => $fail,
+            'src_chars' => $chars,
+            'apps'     => $apps,
+            'last_done' => (int)$last,
+            'revision' => $this->revision(),
+            'db_bytes' => $this->backend === 'sqlite' && is_file(self::dbFile()) ? (int)filesize(self::dbFile()) : (is_file(self::memFile()) ? (int)filesize(self::memFile()) : 0),
+        ];
+    }
+
+    // ---------------------------------------------------------------- meta / app
+
+    public function revision(): string
+    {
+        if ($this->backend === 'sqlite') {
+            $st = $this->pdo->prepare('SELECT v FROM meta WHERE k = ?');
+            $st->execute(['rev']);
+            return (string)($st->fetchColumn() ?: '0');
+        }
+        return (string)($this->mem['meta']['rev'] ?? '0');
+    }
+
+    public function setMeta(string $k, string $v): void
+    {
+        if ($this->backend === 'sqlite') {
+            $st = $this->pdo->prepare('INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v');
+            $st->execute([$k, $v]);
+            return;
+        }
+        $this->mem['meta'][$k] = $v;
+        $this->dirty = true;
+    }
+
+    public function getMeta(string $k, string $default = ''): string
+    {
+        if ($this->backend === 'sqlite') {
+            $st = $this->pdo->prepare('SELECT v FROM meta WHERE k = ?');
+            $st->execute([$k]);
+            $v = $st->fetchColumn();
+            return $v === false ? $default : (string)$v;
+        }
+        return (string)($this->mem['meta'][$k] ?? $default);
+    }
+
+    private function bumpRevision(): void
+    {
+        $rev = (int)$this->revision() + 1;
+        $this->setMeta('rev', (string)$rev);
+    }
+
+    /** @param array<int,array{key:string,name:string,kind:string,ver:string,nseg:int,ndone:int}> $apps */
+    public function setApps(array $apps): void
+    {
+        if (!$apps) {
+            return;
+        }
+        if ($this->backend === 'sqlite') {
+            $this->pdo->beginTransaction();
+            $st = $this->pdo->prepare(
+                'INSERT INTO app (key, name, kind, ver, nseg, ndone, ts) VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(key) DO UPDATE SET name = excluded.name, kind = excluded.kind,
+                 ver = excluded.ver, nseg = excluded.nseg, ndone = excluded.ndone, ts = excluded.ts'
+            );
+            $now = time();
+            foreach ($apps as $a) {
+                $st->execute([$a['key'], $a['name'], $a['kind'], $a['ver'], $a['nseg'], $a['ndone'], $now]);
+            }
+            $this->pdo->commit();
+            return;
+        }
+        foreach ($apps as $a) {
+            $this->mem['app'][$a['key']] = $a + ['ts' => time()];
+        }
+        $this->dirty = true;
+    }
+
+    public function event(string $ev, int $n = 0): void
+    {
+        if ($this->backend === 'sqlite') {
+            $st = $this->pdo->prepare('INSERT INTO hist (ts, ev, n) VALUES (?, ?, ?)');
+            $st->execute([time(), mb_substr($ev, 0, 200), $n]);
+            $this->pdo->exec('DELETE FROM hist WHERE id < (SELECT MAX(id) - 200 FROM hist)');
+            return;
+        }
+        $this->dirty = true;
+    }
+
+    public function recentEvents(int $limit = 12): array
+    {
+        if ($this->backend !== 'sqlite') {
+            return [];
+        }
+        $st = $this->pdo->prepare('SELECT ts, ev, n FROM hist ORDER BY id DESC LIMIT ' . max(1, min(100, $limit)));
+        $st->execute();
+        return $st->fetchAll();
+    }
+
+    /** 失败原因聚合（给日志/界面看，最近原因优先） */
+    public function failureSummary(int $limit = 3): array
+    {
+        $out = [];
+        if ($this->backend === 'sqlite') {
+            $rows = $this->pdo->query(
+                'SELECT err, COUNT(*) AS n FROM seg WHERE st = 2 GROUP BY err ORDER BY n DESC LIMIT ' . max(1, $limit)
+            )->fetchAll();
+            foreach ($rows as $r) {
+                $out[] = ['err' => (string)($r['err'] ?: '未知'), 'n' => (int)$r['n']];
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * 精简队列：删掉未完成、且不符合「只看简介类内容」策略的片段。
+     * - 短文本（< $minChars）多为名称/标签，不需要翻译；
+     * - 只翻译商店时，顺带清掉本机插件描述。
+     */
+    public function compactQueue(int $minChars, bool $dropLocalPlugins): int
+    {
+        if ($this->backend === 'sqlite') {
+            // 注意：SQLite 里 INTEGER 与 TEXT 比较时「整数恒小于文本」，
+            // 所以数字条件不能靠 PDO 的 ? 绑定（默认按字符串传），必须内联。
+            $min = max(0, (int)$minChars);
+            if ($dropLocalPlugins) {
+                $sql = 'DELETE FROM seg WHERE st <> 1 AND (LENGTH(src) < ' . $min . ' OR kind IN ("localdesc","localchg"))';
+            } else {
+                $sql = 'DELETE FROM seg WHERE st <> 1 AND LENGTH(src) < ' . $min;
+            }
+            return (int)$this->pdo->exec($sql);
+        }
+        $n = 0;
+        foreach ($this->mem['seg'] as $h => $s) {
+            if ($s['st'] === 1) {
+                continue;
+            }
+            if (mb_strlen((string)$s['src'], 'UTF-8') < $minChars
+                || ($dropLocalPlugins && in_array((string)$s['kind'], ['localdesc', 'localchg'], true))) {
+                unset($this->mem['seg'][$h]);
+                $n++;
+            }
+        }
+        $this->dirty = $n > 0;
+        return $n;
+    }
+
+    /** 删除所有未完成片段（已翻译的保留） */
+    public function dropPending(): int
+    {
+        if ($this->backend === 'sqlite') {
+            return (int)$this->pdo->exec('DELETE FROM seg WHERE st <> 1');
+        }
+        $n = 0;
+        foreach ($this->mem['seg'] as $h => $s) {
+            if ($s['st'] !== 1) {
+                unset($this->mem['seg'][$h]);
+                $n++;
+            }
+        }
+        $this->dirty = $n > 0;
+        return $n;
+    }
+
+    /** 把所有失败片段放回待译队列（用户修好 Key/网络后需要） */
+    public function resetFailed(): int
+    {
+        if ($this->backend === 'sqlite') {
+            $n = $this->pdo->exec('UPDATE seg SET st = 0, tries = 0, err = "" WHERE st = 2');
+            return (int)$n;
+        }
+        $n = 0;
+        foreach ($this->mem['seg'] as $h => $s) {
+            if ($s['st'] === 2) {
+                $this->mem['seg'][$h]['st'] = 0;
+                $this->mem['seg'][$h]['tries'] = 0;
+                $this->mem['seg'][$h]['err'] = '';
+                $n++;
+            }
+        }
+        $this->dirty = $n > 0;
+        return $n;
+    }
+
+    /** 待译队列的条数与字符数（SQL 聚合，避免把整表读进内存） */
+    public function pendingAggregate(): array
+    {
+        if ($this->backend === 'sqlite') {
+            $maxTries = max(1, Config::int('MAX_TRIES', 8));
+            $row = $this->pdo->query(
+                'SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(src)),0) AS ch
+                 FROM seg WHERE st = 0 OR (st = 2 AND tries < ' . $maxTries . ')'
+            )->fetch();
+            return ['count' => (int)($row['n'] ?? 0), 'chars' => (int)($row['ch'] ?? 0)];
+        }
+        $n = 0;
+        $ch = 0;
+        $maxTries = max(1, Config::int('MAX_TRIES', 8));
+        foreach ($this->mem['seg'] as $s) {
+            if ($s['st'] === 0 || ($s['st'] === 2 && (int)$s['tries'] < $maxTries)) {
+                $n++;
+                $ch += mb_strlen((string)$s['src'], 'UTF-8');
+            }
+        }
+        return ['count' => $n, 'chars' => $ch];
+    }
+
+    /** 指定 kind 的全部 hash（清理时用来保护非应用源词条） */
+    public function hashesByKind(array $kinds): array
+    {
+        if (!$kinds) {
+            return [];
+        }
+        if ($this->backend === 'sqlite') {
+            $ph = implode(',', array_fill(0, count($kinds), '?'));
+            $st = $this->pdo->prepare("SELECT h FROM seg WHERE kind IN ($ph)");
+            $st->execute(array_values($kinds));
+            return $st->fetchAll(\PDO::FETCH_COLUMN);
+        }
+        $out = [];
+        foreach ($this->mem['seg'] as $h => $s) {
+            if (in_array((string)$s['kind'], $kinds, true)) {
+                $out[] = $h;
+            }
+        }
+        return $out;
+    }
+
+    /** 按片段类型统计，用于设置页展示覆盖率 */
+    public function kindStats(): array
+    {
+        $out = [];
+        if ($this->backend === 'sqlite') {
+            $rows = $this->pdo->query(
+                'SELECT kind, COUNT(*) AS total, SUM(CASE WHEN st = 1 THEN 1 ELSE 0 END) AS done
+                 FROM seg GROUP BY kind ORDER BY total DESC'
+            )->fetchAll();
+            foreach ($rows as $r) {
+                $out[] = ['kind' => (string)$r['kind'], 'total' => (int)$r['total'], 'done' => (int)$r['done']];
+            }
+            return $out;
+        }
+        $agg = [];
+        foreach ($this->mem['seg'] as $s) {
+            $k = $s['kind'] ?: 'live';
+            $agg[$k] ??= ['kind' => $k, 'total' => 0, 'done' => 0];
+            $agg[$k]['total']++;
+            if ($s['st'] === 1) {
+                $agg[$k]['done']++;
+            }
+        }
+        usort($agg, fn($a, $b) => $b['total'] <=> $a['total']);
+        return array_values($agg);
+    }
+
+    /** 清空全部翻译（保留队列结构） */
+    public function wipe(): void
+    {
+        if ($this->backend === 'sqlite') {
+            $this->pdo->exec('DELETE FROM seg');
+            $this->pdo->exec('DELETE FROM app');
+            $this->pdo->exec('DELETE FROM hist');
+            $this->setMeta('rev', '0');
+            return;
+        }
+        $this->mem = ['seg' => [], 'app' => [], 'meta' => ['rev' => '0']];
+        $this->dirty = true;
+        $this->flush();
+    }
+
+    /** 删除不在 $keepHashes 里的历史词条（商店下架/改名后清理） */
+    public function prune(array $keepHashes): int
+    {
+        $keep = array_fill_keys($keepHashes, true);
+        if ($this->backend === 'sqlite') {
+            $n = 0;
+            $this->pdo->beginTransaction();
+            $del = $this->pdo->prepare('DELETE FROM seg WHERE h = ?');
+            $rows = $this->pdo->query('SELECT h FROM seg')->fetchAll(\PDO::FETCH_COLUMN);
+            foreach ($rows as $h) {
+                if (!isset($keep[$h])) {
+                    $del->execute([$h]);
+                    $n += $del->rowCount();
+                }
+            }
+            $this->pdo->commit();
+            return $n;
+        }
+        $n = 0;
+        foreach (array_keys($this->mem['seg']) as $h) {
+            if (!isset($keep[$h])) {
+                unset($this->mem['seg'][$h]);
+                $n++;
+            }
+        }
+        $this->dirty = $n > 0;
+        return $n;
+    }
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/include/translator.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * unraid.zh.translator — 编排层
+ *
+ * 三个入口：
+ *   lookup()          浏览器把页面上看到的英文批量送来，命中就返回中文，缺失就按需翻译；
+ *   translatePending() 后台把队列里的待译片段翻完（受时间预算约束，可被 cron 反复调用）；
+ *   sync()            重新抓取应用源、重算 hash、把「变了的文案」排进队列。
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+require_once __DIR__ . '/util.php';
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/store.php';
+require_once __DIR__ . '/llm.php';
+require_once __DIR__ . '/source_feed.php';
+require_once __DIR__ . '/source_local.php';
+
+final class Translator
+{
+    public static function store(): Store
+    {
+        return Store::open();
+    }
+
+    // ------------------------------------------------------------------ 锁
+
+    public static function lockFile(): string
+    {
+        return lock_file();
+    }
+
+    /**
+     * @return array{ok:bool,handle:resource|null,error?:string,busy?:bool}
+     */
+    public static function tryLock(): array
+    {
+        $path = self::lockFile();
+        $f = @fopen($path, 'c');
+        if (!$f) {
+            return ['ok' => false, 'handle' => null, 'error' => '无法创建锁文件: ' . $path];
+        }
+        if (!flock($f, LOCK_EX | LOCK_NB)) {
+            fclose($f);
+            return ['ok' => false, 'handle' => null, 'busy' => true, 'error' => '已有同步/翻译任务在运行'];
+        }
+        ftruncate($f, 0);
+        fwrite($f, (string)getmypid());
+        fflush($f);
+        return ['ok' => true, 'handle' => $f];
+    }
+
+    public static function unlock($handle): void
+    {
+        if (is_resource($handle)) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+    }
+
+    public static function workerRunning(): bool
+    {
+        $f = @fopen(self::lockFile(), 'c');
+        if (!$f) {
+            return false;
+        }
+        $free = flock($f, LOCK_EX | LOCK_NB);
+        if ($free) {
+            flock($f, LOCK_UN);
+            fclose($f);
+            return false;
+        }
+        fclose($f);
+        return true;
+    }
+
+    // ------------------------------------------------------------------ 页面查询
+
+    /**
+     * @param array<int,string> $texts 浏览器送来的原始文本（已尽力规范化，服务端仍再规范一次）
+     * @return array{hits:array<string,string>,queued:int,translated_now:int,failed:int,rev:string,error?:string}
+     */
+    public static function lookup(array $texts, ?bool $allowSync = null): array
+    {
+        $allowSync ??= Config::bool('SYNC_ON_LOOKUP');
+        $store = self::store();
+        $rev0 = $store->revision();
+
+        // 1) 收集请求（浏览器已规范化，这里再做一次，保证幂等）
+        $reqs = [];
+        foreach ($texts as $t) {
+            if (!is_string($t)) {
+                continue;
+            }
+            $norm = normalize_text($t);
+            $len = mb_strlen($norm, 'UTF-8');
+            if ($len < 5 || $len > 20000) {
+                continue;
+            }
+            if (has_cjk($norm) || looks_untranslatable($norm)) {
+                continue;
+            }
+            $reqs[$norm] = true;
+            if (count($reqs) >= 300) {
+                break;
+            }
+            // 单条请求最多入库 400 个片段（多行文本会按行展开）
+            if (count($reqs) * 2 >= 800) {
+                break;
+            }
+        }
+        if (!$reqs) {
+            return ['hits' => [], 'queued' => $store->countPending(), 'translated_now' => 0, 'failed' => 0, 'rev' => $rev0];
+        }
+
+        // 2) 候选 = 请求本身（只读探测） + 多行文本的每一行（可入库）
+        $probe = [];     // norm => hash
+        $cand = [];      // norm => hash，可能会入库
+        $lines = [];     // norm => array<int,string>
+        foreach ($reqs as $norm => $_) {
+            $probe[$norm] = segment_hash($norm);
+            if (count($cand) >= 400) {
+                break;
+            }
+            if (str_contains($norm, "\n")) {
+                $parts = [];
+                foreach (explode("\n", $norm) as $line) {
+                    $line = trim($line);
+                    if ($line === '') {
+                        continue;
+                    }
+                    $parts[] = $line;
+                    if (is_translatable($line)) {
+                        $cand[$line] = segment_hash($line);
+                        $probe[$line] = $cand[$line];
+                    }
+                }
+                $lines[$norm] = $parts;
+            } else {
+                $cand[$norm] = $probe[$norm];
+            }
+        }
+
+        // 3) 查缓存
+        $rows = $store->getByHashes(array_values($probe));
+        $resolved = [];   // norm => 译文
+        $writeback = [];
+        foreach ($rows as $h => $row) {
+            if ((int)$row['st'] === 1 && is_string($row['dst']) && $row['dst'] !== '') {
+                $resolved[$row['src']] = $row['dst'];
+                $writeback[$row['src']] = true;
+            }
+        }
+
+        // 4) 缺失的片段入库并（可选）立即翻译
+        $miss = [];
+        foreach ($cand as $norm => $h) {
+            if (isset($resolved[$norm])) {
+                continue;
+            }
+            $row = $rows[$h] ?? null;
+            // 新出现的文本：只收「一段话以上」的简介类内容。
+            // 应用名、分类短标签、按钮文字等不进队列（已经在库里的仍可命中）。
+            if ($row === null && !self::qualifiesAsLive($norm)) {
+                continue;
+            }
+            if ($row && (int)$row['st'] === 2 && (int)$row['tries'] >= 3) {
+                continue; // 连续失败，不再打扰模型
+            }
+            $miss[$norm] = $h;
+        }
+
+        $translatedNow = 0;
+        $failed = 0;
+        $error = '';
+        if ($miss) {
+            $rowsIn = [];
+            foreach ($miss as $norm => $h) {
+                $rowsIn[] = ['h' => $h, 'src' => $norm, 'kind' => 'live', 'app' => ''];
+            }
+            $store->upsertSegments($rowsIn, true);   // insertOnly：命中行不做空写
+
+            $chars = 0;
+            foreach ($miss as $norm => $_) {
+                $chars += mb_strlen($norm, 'UTF-8');
+            }
+            $budget = max(0, Config::int('SYNC_MAX_CHARS', 4000));
+            // 滚动小时预算：防止某个页面/脚本把额度刷爆（超出只入队，由后台任务处理）
+            $hourKey = 'budget_' . date('YmdH');
+            $hourlyCap = max(0, Config::int('HOURLY_CHAR_BUDGET', 120000));
+            $hourlyUsed = (int)$store->getMeta($hourKey, '0');
+            $withinBudget = $hourlyCap === 0 || ($hourlyUsed + $chars) <= $hourlyCap;
+            if ($allowSync && Config::bool('AUTO_NEW') && $chars <= $budget && count($miss) <= 40 && $withinBudget) {
+                $store->setMeta($hourKey, (string)($hourlyUsed + $chars));
+                $llm = new Llm();
+                if ($llm->ready()) {
+                    $items = [];
+                    foreach ($miss as $norm => $h) {
+                        $items[] = ['h' => $h, 'src' => $norm];
+                    }
+                    $res = $llm->translateBatch($items);
+                    $doneRows = [];
+                    foreach ($res['hits'] as $h => $dst) {
+                        $doneRows[] = ['h' => $h, 'dst' => $dst];
+                    }
+                    if ($doneRows) {
+                        $store->setDone($doneRows);
+                        $translatedNow = count($doneRows);
+                        foreach ($miss as $norm => $h) {
+                            if (isset($res['hits'][$h])) {
+                                $resolved[$norm] = $res['hits'][$h];
+                            }
+                        }
+                        jlog(sprintf('按需翻译 %d 条（%d 字符）', $translatedNow, $chars));
+                    }
+                    foreach ($res['errors'] as $h => $err) {
+                        if (!isset($res['hits'][$h])) {
+                            $store->setFail($h, (string)$err);
+                            $failed++;
+                            if ($error === '') {
+                                $error = (string)$err;
+                            }
+                        }
+                    }
+                } else {
+                    $error = '尚未配置大模型接口';
+                }
+            }
+        }
+
+        // 5) 组装结果：整段命中，或「逐行全部命中则拼接」
+        $hits = [];
+        foreach ($reqs as $norm => $_) {
+            if (isset($resolved[$norm])) {
+                $hits[$norm] = $resolved[$norm];
+                continue;
+            }
+            if (!isset($lines[$norm])) {
+                continue;
+            }
+            $out = [];
+            $translatable = 0;
+            $ok = 0;
+            foreach ($lines[$norm] as $line) {
+                $need = is_translatable($line);
+                if ($need) {
+                    $translatable++;
+                }
+                if (isset($resolved[$line])) {
+                    $out[] = $resolved[$line];
+                    if ($need) {
+                        $ok++;
+                    }
+                } else {
+                    $out[] = $line;
+                }
+            }
+            if ($translatable > 0 && $ok === $translatable) {
+                $hits[$norm] = implode("\n", $out);
+            }
+        }
+
+        return [
+            'hits' => $hits,
+            'queued' => $store->countPending(),
+            'translated_now' => $translatedNow,
+            'failed' => $failed,
+            'rev' => $store->revision(),
+            'asked' => count($reqs),
+            'error' => $error,
+        ];
+    }
+
+    /**
+     * 是否够格作为「页面即时采集」的新文本：
+     * 长度达到 LIVE_MIN_CHARS，或至少有 6 个英文单词（覆盖较短的整句）。
+     */
+    private static function qualifiesAsLive(string $norm): bool
+    {
+        $min = max(0, Config::int('LIVE_MIN_CHARS', 40));
+        if (mb_strlen($norm, 'UTF-8') >= $min) {
+            return true;
+        }
+        // 注意：不要把 preg_match_all 的结果转成 bool 再和 6 比较 ——
+        // PHP 会把数字也转成 bool，"true >= 6" 恒为 true。
+        return preg_match_all('/[A-Za-z][A-Za-z0-9\'-]{1,}/', $norm) >= 6;
+    }
+
+    // ------------------------------------------------------------------ 后台翻译
+
+    /**
+     * @return array{done:int,failed:int,remaining:int,busy?:bool,error?:string,seconds:float}
+     */
+    public static function translatePending(int $budgetSeconds = 300, int $maxSegments = 2000, int $chain = 0): array
+    {
+        $t0 = microtime(true);
+        $lock = self::tryLock();
+        if (!$lock['ok']) {
+            return [
+                'done' => 0, 'failed' => 0, 'remaining' => self::store()->countPending(),
+                'busy' => !empty($lock['busy']), 'error' => (string)($lock['error'] ?? ''),
+                'seconds' => 0.0,
+            ];
+        }
+        $out = ['done' => 0, 'failed' => 0, 'remaining' => 0, 'seconds' => 0.0, 'chain' => $chain];
+        $llm = null;
+        try {
+            $llm = new Llm();
+            $store = self::store();
+            if (!$llm->ready()) {
+                $out['error'] = '尚未配置大模型接口（设置 → 插件中文化 → 大模型）';
+                $out['remaining'] = $store->countPending();
+                return $out;
+            }
+            $budgetSeconds = max(10, $budgetSeconds);
+            $processed = 0;
+            $batchNo = 0;
+            $lastLog = 0.0;
+            while ($processed < $maxSegments) {
+                $elapsed = microtime(true) - $t0;
+                if ($elapsed >= $budgetSeconds) {
+                    jlog(sprintf('达到单次运行时间预算（%d 秒），队列还剩 %d 条，准备自动续跑',
+                        $budgetSeconds, $store->countPending()));
+                    break;
+                }
+                $rows = $store->pending(min(200, $maxSegments - $processed));
+                if (!$rows) {
+                    break;
+                }
+                $batchStart = microtime(true);
+                $items = [];
+                foreach ($rows as $r) {
+                    $items[] = ['h' => $r['h'], 'src' => $r['src']];
+                }
+                $res = $llm->translateBatch($items);
+                $doneRows = [];
+                foreach ($res['hits'] as $h => $dst) {
+                    $doneRows[] = ['h' => $h, 'dst' => $dst];
+                }
+                if ($doneRows) {
+                    $store->setDone($doneRows);
+                    $out['done'] += count($doneRows);
+                }
+                foreach ($res['errors'] as $h => $err) {
+                    if (isset($res['hits'][$h])) {
+                        continue;   // 同一批里既有译文又有错误时，以译文为准
+                    }
+                    $store->setFail($h, (string)$err);
+                    $out['failed']++;
+                }
+                $processed += count($rows);
+                $batchNo++;
+
+                // —— 进度日志：每批一行，最快 5 秒一行，避免刷屏
+                if (microtime(true) - $lastLog >= 5 || $batchNo === 1) {
+                    $lastLog = microtime(true);
+                    $spent = $lastLog - $t0;
+                    $rate = $out['done'] > 0 ? $out['done'] / max(0.1, $spent) : 0.0;   // 条/秒
+                    $left = $store->countPending();
+                    $msg = sprintf(
+                        '翻译进度：本轮完成 %d，失败 %d，剩余 %d，速度 %.1f 条/分，最近一批 %d 条 %.1fs',
+                        $out['done'], $out['failed'], $left, $rate * 60,
+                        count($rows), microtime(true) - $batchStart
+                    );
+                    if ($rate > 0 && $left > 0) {
+                        $msg .= '，按此速度还需 ' . human_age((int)round($left / $rate));
+                    }
+                    jlog($msg);
+                }
+
+                if (!$doneRows && $res['errors']) {
+                    jlog('整批翻译失败，中断本轮：' . reset($res['errors']), 'WARN');
+                    break;
+                }
+                if (function_exists('gc_collect_cycles')) {
+                    gc_collect_cycles();
+                }
+            }
+            $out['remaining'] = $store->countPending();
+            if ($llm->calls > 0) {
+                $store->setMeta('llm_req_last', (string)$llm->calls);
+                $store->setMeta('llm_ms_last', (string)(int)round($llm->msTotal));
+                $store->setMeta('llm_avg_ms', (string)(int)round($llm->msTotal / $llm->calls));
+            }
+            $store->event(sprintf('translate done=%d failed=%d left=%d', $out['done'], $out['failed'], $out['remaining']), $out['done']);
+        } finally {
+            self::unlock($lock['handle']);
+            self::store()->flush();
+        }
+
+        $out['seconds'] = round(microtime(true) - $t0, 2);
+        $summary = sprintf('翻译轮结束：完成 %d，失败 %d，剩余 %d，用时 %.1fs', $out['done'], $out['failed'], $out['remaining'], $out['seconds']);
+        $fails = self::store()->failureSummary(3);
+        if ($fails) {
+            $parts = [];
+            foreach ($fails as $f) {
+                $parts[] = sprintf('%s ×%d', mb_substr($f['err'], 0, 80), $f['n']);
+            }
+            $summary .= '；失败原因：' . implode('；', $parts);
+        }
+        jlog($summary);
+        if ($fails) {
+            $out['failures'] = $fails;
+        }
+
+        // —— 自动续跑（锁已释放；新进程会重新抢锁）
+        $out['continuing'] = false;
+        $madeProgress = ($out['done'] > 0 || $out['failed'] === 0);
+        if ($out['remaining'] > 0 && Config::bool('AUTO_CONTINUE')) {
+            $maxChain = max(1, Config::int('MAX_CHAIN', 40));
+            if (!$madeProgress) {
+                jlog('本轮没有任何进展（全部失败），已停止自动续跑，请检查模型地址/Key/额度', 'WARN');
+            } elseif ($chain >= $maxChain) {
+                jlog('已达到自动续跑链长上限（' . $maxChain . '），停止；下次 cron/按钮会继续', 'WARN');
+            } elseif (self::spawnTranslateChain($chain + 1, $budgetSeconds)) {
+                $out['continuing'] = true;
+                jlog(sprintf('队列还剩 %d 条，已自动开始下一轮（链 #%d）', $out['remaining'], $chain + 1));
+            } else {
+                jlog('自动续跑失败（无法启动子进程），请手动点「翻译待译队列」', 'WARN');
+            }
+        }
+        return $out;
+    }
+
+    /** 后台再起一个 translate 进程（自动续跑） */
+    private static function spawnTranslateChain(int $chain, int $budgetSeconds): bool
+    {
+        $php = php_cli_binary();
+        if ($php === '') {
+            return false;
+        }
+        $worker = plugin_dir() . '/scripts/worker.php';
+        if (!is_file($worker)) {
+            return false;
+        }
+        $cmd = implode(' ', array_map('escapeshellarg', [
+            $php, '-d', 'memory_limit=1024M', '-d', 'display_errors=0', $worker,
+            'translate', '--seconds=' . $budgetSeconds, '--chain=' . $chain,
+        ]));
+        $cmd .= ' >> ' . escapeshellarg(log_file()) . ' 2>&1 &';
+        @exec($cmd);
+        return true;
+    }
+
+    /** 清空所有未完成的片段（改成纯按需翻译；已译的保留） */
+    public static function dropPending(): array
+    {
+        $n = self::store()->dropPending();
+        self::store()->event('drop-pending -' . $n, $n);
+        jlog(sprintf('清空未译队列：删除 %d 条（保留已译 %d 条）', $n, self::store()->stats()['done']));
+        return ['ok' => true, 'removed' => $n];
+    }
+
+    /** 精简队列：删掉未完成且不符合「只看简介」策略的片段 */
+    public static function compact(?bool $dropLocal = null): array
+    {
+        $min = max(0, Config::int('LIVE_MIN_CHARS', 40));
+        $dropLocal ??= (Config::get('SCOPE') === 'store');
+        $n = self::store()->compactQueue($min, $dropLocal);
+        self::store()->event('compact -' . $n, $n);
+        jlog(sprintf('精简队列：删除 %d 条短文本/本机插件片段（阈值 %d 字符，缩放本机插件=%s）',
+            $n, $min, $dropLocal ? '是' : '否'));
+        return ['ok' => true, 'removed' => $n, 'min_chars' => $min, 'drop_local' => $dropLocal];
+    }
+
+    // ------------------------------------------------------------------ 同步
+
+    /**
+     * @return array{ok:bool,added:int,existed:int,total:int,apps:int,error?:string,meta?:array,ms:int}
+     */
+    public static function sync(bool $forceFetch = false, ?callable $log = null, ?bool $includeLocal = null): array
+    {
+        $t0 = microtime(true);
+        // 只翻译商店时，没必要去解析已安装插件的 .plg
+        $includeLocal ??= (Config::get('SCOPE') !== 'store');
+        $say = function (string $m) use ($log) {
+            jlog($m);
+            if ($log) {
+                $log($m);
+            }
+        };
+        $lock = self::tryLock();
+        if (!$lock['ok']) {
+            return ['ok' => false, 'added' => 0, 'existed' => 0, 'total' => 0, 'apps' => 0, 'error' => (string)($lock['error'] ?? '无法启动'), 'ms' => 0];
+        }
+        try {
+            $say('开始同步应用源…');
+            $fetched = SourceFeed::fetch($forceFetch, $say);
+            if (!$fetched['ok']) {
+                return ['ok' => false, 'added' => 0, 'existed' => 0, 'total' => 0, 'apps' => 0, 'error' => (string)($fetched['error'] ?? '下载失败'), 'ms' => (int)round((microtime(true) - $t0) * 1000)];
+            }
+            $parsed = SourceFeed::extract($fetched['file'], $say);
+            if (!$parsed['ok']) {
+                return ['ok' => false, 'added' => 0, 'existed' => 0, 'total' => 0, 'apps' => 0, 'error' => (string)($parsed['error'] ?? '解析失败'), 'ms' => (int)round((microtime(true) - $t0) * 1000)];
+            }
+            $store = self::store();
+            $up = $store->upsertSegments($parsed['segments']);
+            $say(sprintf('商店片段：新增 %d，已存在 %d', $up['added'], $up['existed']));
+
+            if ($includeLocal) {
+                $local = SourceLocal::extract();
+                if ($local['ok'] && $local['segments']) {
+                    $up2 = $store->upsertSegments($local['segments']);
+                    $say(sprintf('本地插件片段：新增 %d，已存在 %d', $up2['added'], $up2['existed']));
+                    $up['added'] += $up2['added'];
+                    $up['existed'] += $up2['existed'];
+                    $store->setApps($local['apps']);
+                }
+            }
+
+            $store->setApps($parsed['apps']);
+            foreach ($parsed['meta'] as $k => $v) {
+                $store->setMeta($k, (string)$v);
+            }
+            $store->setMeta('synced_at', (string)time());
+            $store->setMeta('feed_source', (string)($fetched['source'] ?? ''));
+            $store->setMeta('feed_stamp', (string)($fetched['stamp'] ?? 0));
+            $store->setMeta('feed_age', (string)($fetched['age'] ?? 0));
+            $store->setMeta('feed_from_local', !empty($fetched['from_local']) ? '1' : '0');
+            $store->setMeta('feed_file', (string)($fetched['file'] ?? ''));
+            $store->setMeta('feed_file_ts', (string)(int)($parsed['meta']['feed_ts'] ?? time()));
+            $store->event(sprintf('sync +%d / =%d', $up['added'], $up['existed']), $up['added']);
+            $stats = $store->stats();
+            $say(sprintf('同步完成：词条总数 %d，已完成 %d，待译 %d', $stats['total'], $stats['done'], $stats['pending']));
+            return [
+                'ok' => true,
+                'added' => (int)$up['added'],
+                'existed' => (int)$up['existed'],
+                'total' => (int)$stats['total'],
+                'apps' => (int)$stats['apps'],
+                'meta' => $parsed['meta'],
+                'ms' => (int)round((microtime(true) - $t0) * 1000),
+            ];
+        } finally {
+            self::unlock($lock['handle']);
+            self::store()->flush();
+        }
+    }
+
+    /** 清理已经不在应用源里的历史词条 */
+    public static function prune(): array
+    {
+        $parsed = SourceFeed::extract(null);
+        if (!$parsed['ok']) {
+            return ['ok' => false, 'removed' => 0, 'error' => $parsed['error'] ?? '解析失败'];
+        }
+        $keep = array_column($parsed['segments'], 'h');
+        $local = SourceLocal::extract();
+        if ($local['ok']) {
+            $keep = array_merge($keep, array_column($local['segments'], 'h'));
+        }
+        // 页面按需采集（live）、后台实测等词条不属于应用源，一律保留
+        $keep = array_merge($keep, self::store()->hashesByKind(['live', 'demo', 'legacy']));
+        $n = self::store()->prune($keep);
+        self::store()->event('prune', $n);
+        jlog('清理过期词条: ' . $n);
+        return ['ok' => true, 'removed' => $n, 'kept' => count($keep)];
+    }
+
+    /** 估算：全量翻译需要多少字符 / 请求 */
+    public static function estimate(): array
+    {
+        $stats = self::store()->stats();
+        $agg = self::store()->pendingAggregate();
+        $pendingCount = (int)$agg['count'];
+        $pendingChars = (int)$agg['chars'];
+        $batch = max(1, Config::int('BATCH_ITEMS', 48));
+        $requests = (int)ceil($pendingCount / $batch);
+        $avg = (int)self::store()->getMeta('llm_avg_ms', '0');
+        return [
+            'pending' => $pendingCount,
+            'pending_chars' => $pendingChars,
+            'requests' => $requests,
+            'done_chars' => $stats['src_chars'],
+            'avg_req_ms' => $avg,
+            'eta_seconds' => $avg > 0 ? (int)round($requests * $avg / 1000) : 0,
+            'last_run' => [
+                'requests' => (int)self::store()->getMeta('llm_req_last', '0'),
+                'ms' => (int)self::store()->getMeta('llm_ms_last', '0'),
+            ],
+        ];
+    }
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/include/util.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * unraid.zh.translator — 通用工具
+ *
+ * 文本规范化在这里定义，必须与 js/store-zh.js 内 uztNorm() 完全一致，
+ * 否则浏览器端取到的键会与数据库里的 hash 对不上。
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+const PLUGIN   = 'unraid.zh.translator';
+const VERSION  = '2026.11.19';
+
+/** 插件在 webGui 中的根目录（tmpfs，随 .plg 安装重建） */
+function plugin_dir(): string
+{
+    static $d = null;
+    if ($d === null) {
+        $guess = __DIR__ . '/..';
+        $d = realpath($guess) ?: $guess;
+    }
+    return $d;
+}
+
+/** 持久化目录（U 盘 /boot，重启后仍在） */
+function cfg_dir(): string
+{
+    return '/boot/config/plugins/' . PLUGIN;
+}
+
+/** 运行期目录：优先 RAM，避免折磨 U 盘 */
+function var_dir(): string
+{
+    $d = '/usr/local/emhttp/plugins/' . PLUGIN . '/var';
+    if (is_dir($d) && is_writable($d)) {
+        return $d;
+    }
+    $fallback = cfg_dir() . '/var';
+    if (!is_dir($fallback)) {
+        @mkdir($fallback, 0770, true);
+    }
+    return $fallback;
+}
+
+function log_file(): string
+{
+    return cfg_dir() . '/logs/worker.log';
+}
+
+/** 只保留最近 N 行，防止日志把 U 盘写满 */
+function log_rotate(string $file, int $maxBytes = 1048576): void
+{
+    clearstatcache(true, $file);
+    if (!is_file($file) || filesize($file) < $maxBytes) {
+        return;
+    }
+    $data = file($file) ?: [];
+    $keep = array_slice($data, -2000);
+    @file_put_contents($file, implode('', $keep), LOCK_EX);
+}
+
+function jlog(string $msg, string $level = 'INFO', bool $echo = false): void
+{
+    $dir = dirname(log_file());
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0770, true);
+    }
+    log_rotate(log_file());
+    $line = sprintf("[%s] [%s] %s\n", date('Y-m-d H:i:s'), $level, $msg);
+    @file_put_contents(log_file(), $line, FILE_APPEND | LOCK_EX);
+    if ($echo) {
+        echo $line;
+    }
+}
+
+/**
+ * 规范化：统一换行 / 折叠行内空白 / 去首尾空白 / 丢弃空行。
+ *
+ * 空白字符集用**显式码点**定义，不用 trim()/\s —— 否则 PHP 的 trim()（只认 ASCII）
+ * 与 JS 的 \s（认全部 Unicode 空白）会算出不同的键，译文永远命中不了。
+ * 与 js/uzt-norm.js 的 norm() 必须逐字符一致；tests/norm_parity.mjs 会对照。
+ */
+const WS_INLINE = '[\t\x0B\f \x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]';
+
+function normalize_text(string $s): string
+{
+    $s = str_replace(["\r\n", "\r"], "\n", $s);
+    $out = [];
+    foreach (explode("\n", $s) as $line) {
+        $line = preg_replace('/' . WS_INLINE . '+/u', ' ', $line) ?? $line;
+        $line = preg_replace('/^ +| +$/u', '', $line) ?? $line;
+        if ($line !== '') {
+            $out[] = $line;
+        }
+    }
+    return implode("\n", $out);
+}
+
+function segment_hash(string $normalized): string
+{
+    return sha1($normalized);
+}
+
+function has_cjk(string $s): bool
+{
+    return preg_match('/[\x{3400}-\x{9FFF}\x{F900}-\x{FAFF}]/u', $s) === 1;
+}
+
+function has_letter(string $s): bool
+{
+    return preg_match('/[A-Za-z]/', $s) === 1;
+}
+
+/**
+ * 不值得翻译的串：URL、路径、文件名、版本号、环境变量风格常量、标识符/镜像名。
+ * 与 js/uzt-norm.js 的 looksUntranslatable() 保持一致。
+ */
+function looks_untranslatable(string $s): bool
+{
+    $t = trim($s);
+    if ($t === '') {
+        return true;
+    }
+    if (preg_match('#^(https?://|ftp://|//|/[\w./-]*$|[a-z][a-z0-9+.-]*://)#i', $t)) {
+        return true;
+    }
+    if (preg_match('#^[\w./-]+\.(json|xml|ya?ml|js|css|html?|php|sh|png|jpe?g|gif|svg|webp|md|txt|log|db|cfg|ini|plg|txz|tar|gz|zip)$#i', $t)) {
+        return true;
+    }
+    if (preg_match('#^(v?\d+(\.\d+)*[a-z0-9.+-]*|\d+(\.\d+)?\s*(kb|mb|gb|tb|ms|s|min|h|%))$#i', $t)) {
+        return true;
+    }
+    if (preg_match('/^[A-Z0-9]{2,}$/', $t)) {
+        return true; // PUID / TZ / AMD64 之类的常量
+    }
+    // 去掉句末标点后判断："Requires:" / "Change log:" 这类标签应当翻译
+    $probe = preg_replace('/[\s:：,，。.；;]+$/u', '', $t) ?: $t;
+    if (!preg_match('/\s/', $probe)) {
+        // 单词：含标识符字符或数字的按标识符处理；过短的也不值得翻
+        if (preg_match('#[_/:.+=]|\d#', $probe)) {
+            return true;
+        }
+        if (mb_strlen($probe, 'UTF-8') < 5) {
+            return true;
+        }
+    }
+    return !has_letter($t);
+}
+
+/** 是否值得作为一条待译文本：长度合适、含英文、不含中文 */
+function is_translatable(string $raw, int $minChars = 5, int $maxChars = 20000): bool
+{
+    $n = normalize_text($raw);
+    $len = mb_strlen($n, 'UTF-8');
+    if ($len < $minChars || $len > $maxChars) {
+        return false;
+    }
+    if (has_cjk($n)) {
+        return false;
+    }
+    return !looks_untranslatable($n);
+}
+
+function atomic_write(string $file, string $data, int $mode = 0660): bool
+{
+    $dir = dirname($file);
+    if (!is_dir($dir) && !@mkdir($dir, 0770, true)) {
+        return false;
+    }
+    $tmp = $file . '.tmp' . getmypid();
+    if (@file_put_contents($tmp, $data, LOCK_EX) === false) {
+        return false;
+    }
+    @chmod($tmp, $mode);
+    if (!@rename($tmp, $file)) {
+        @unlink($tmp);
+        return false;
+    }
+    return true;
+}
+
+function json_response(array $payload, int $code = 200): void
+{
+    if (!headers_sent()) {
+        http_response_code($code);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, max-age=0');
+    }
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+    exit;
+}
+
+function read_json_body(): array
+{
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : [];
+}
+
+/** CSRF 校验：Unraid 在 /var/local/emhttp/var.ini 里提供 csrf_token */
+function csrf_token(): string
+{
+    static $t = null;
+    if ($t !== null) {
+        return $t;
+    }
+    $t = '';
+    if (is_readable('/var/local/emhttp/var.ini')) {
+        $var = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
+        $t = (string)($var['csrf_token'] ?? '');
+    }
+    return $t;
+}
+
+function check_csrf(?string $sent): bool
+{
+    $have = csrf_token();
+    if ($have === '') {
+        // 读不到 Unraid 的 var.ini 时无法验证，一律拒绝（避免静默放行写操作）
+        jlog('CSRF: 无法读取 /var/local/emhttp/var.ini 中的 csrf_token，请求已拒绝', 'WARN');
+        return false;
+    }
+    return is_string($sent) && $sent !== '' && hash_equals($have, $sent);
+}
+
+/**
+ * 找到真正的 PHP CLI 可执行文件。
+ *
+ * 关键：php-fpm 进程里的 PHP_BINARY 是 /usr/sbin/php-fpm，直接拿它去跑脚本
+ * 只会打印 FPM 的 usage —— 必须探测出真正能执行 PHP 代码的 CLI 二进制。
+ */
+function php_cli_binary(): string
+{
+    static $found = null;
+    if ($found !== null) {
+        return $found;
+    }
+    $custom = '';
+    if (class_exists('\\UZT\\Config')) {
+        $custom = trim((string)Config::get('PHP_CLI'));
+    }
+    $probe = static function (string $bin): ?bool {
+        if (!function_exists('shell_exec')) {
+            return null;   // 无法探测时只能信任文件名
+        }
+        $out = @shell_exec(escapeshellarg($bin) . ' -r ' . escapeshellarg('echo PHP_SAPI;') . ' 2>/dev/null');
+        if ($out === null) {
+            return null;
+        }
+        return trim((string)$out) === 'cli';
+    };
+    if ($custom !== '' && is_file($custom) && is_executable($custom)) {
+        $okCustom = $probe($custom);
+        if ($okCustom === true || $okCustom === null) {
+            $found = $custom;
+            return $found;
+        }
+        jlog('手填的 PHP CLI 不能执行 PHP 代码（很像 php-fpm/php-cgi），已改为自动探测: ' . $custom, 'WARN');
+    }
+    $cands = [];
+    if (PHP_SAPI === 'cli' && PHP_BINARY !== '') {
+        $cands[] = PHP_BINARY;
+    }
+    $cands[] = '/usr/bin/php';
+    if (defined('PHP_BINDIR')) {
+        $cands[] = PHP_BINDIR . '/php';
+    }
+    $cands[] = '/usr/local/bin/php';
+    foreach (glob('/usr/bin/php[0-9]*') ?: [] as $g) {
+        $cands[] = $g;
+    }
+    $seen = [];
+    foreach ($cands as $c) {
+        if (isset($seen[$c]) || !is_file($c) || !is_executable($c)) {
+            continue;
+        }
+        $seen[$c] = true;
+        if (preg_match('/php-fpm|php-cgi/i', basename($c))) {
+            continue;   // 这两个不是 CLI
+        }
+        $okBin = $probe($c);
+        if ($okBin === null) {
+            $found = $c;    // shell_exec 被禁用：只能信任文件名判断
+            return $found;
+        }
+        if ($okBin === true) {
+            $found = $c;
+            return $found;
+        }
+    }
+    jlog('找不到可用的 PHP CLI（尝试过：' . implode(', ', array_keys($seen)) . '），后台任务无法启动', 'ERROR');
+    $found = '';
+    return $found;
+}
+
+/**
+ * 运行 CLI 命令（后台），用于按钮触发 worker。
+ *
+ * 参数用数组传入并逐个 escapeshellarg —— 不要把外部字符串拼进 shell。
+ * 启动后会等 worker 写出第一行日志，确认它真的跑起来了；否则明确报错，
+ * 而不是让界面显示"已启动"却什么都没发生。
+ *
+ * @param array<int,string> $argv
+ * @return array{ok:bool,cmd?:string,error?:string,php?:string}
+ */
+function spawn_worker(array $argv): array
+{
+    $php = php_cli_binary();
+    if ($php === '') {
+        return ['ok' => false, 'error' => '找不到 PHP CLI 可执行文件（可在设置里手动填写 PHP CLI 路径）'];
+    }
+    $worker = plugin_dir() . '/scripts/worker.php';
+    if (!is_file($worker)) {
+        return ['ok' => false, 'error' => 'worker.php 缺失: ' . $worker, 'php' => $php];
+    }
+    $logDir = dirname(log_file());
+    if (!is_dir($logDir) || !is_writable($logDir)) {
+        return ['ok' => false, 'error' => '日志目录不可写: ' . $logDir . '（检查 /boot 是否只读或已满）', 'php' => $php];
+    }
+    $cmd = implode(' ', array_map('escapeshellarg', array_merge(
+        [$php, '-d', 'memory_limit=1024M', '-d', 'display_errors=0', $worker],
+        array_values($argv)
+    )));
+    $cmd .= ' >> ' . escapeshellarg(log_file()) . ' 2>&1 &';
+
+    clearstatcache(true, log_file());
+    $before = @filesize(log_file()) ?: 0;
+    @exec($cmd, $out, $rc);
+
+    // 等 worker 落第一行日志（最多 2 秒）：确认真的启动成功
+    $deadline = microtime(true) + 2.0;
+    while (microtime(true) < $deadline) {
+        clearstatcache(true, log_file());
+        if ((@filesize(log_file()) ?: 0) > $before) {
+            return ['ok' => true, 'cmd' => $cmd, 'php' => $php];
+        }
+        usleep(100000);
+    }
+    jlog('后台任务未能启动（2 秒内无日志输出）: ' . $cmd, 'ERROR');
+    return [
+        'ok' => false,
+        'cmd' => $cmd,
+        'php' => $php,
+        'error' => '后台任务未能启动：' . basename($php) . ' 没有产生任何输出，请查看日志或手动执行 php ' . $worker . ' stats',
+    ];
+}
+
+/** 固定的锁文件路径：不随「谁在跑」变化，避免 web 与 cron 各锁各的 */
+function lock_file(): string
+{
+    $candidates = ['/var/lock/' . PLUGIN . '.lock', sys_get_temp_dir() . '/' . PLUGIN . '.lock'];
+    foreach ($candidates as $dir) {
+        $d = dirname($dir);
+        if (is_dir($d) && is_writable($d)) {
+            return $dir;
+        }
+    }
+    return $candidates[0];
+}
+
+function human_age(int $seconds): string
+{
+    $seconds = max(0, $seconds);
+    if ($seconds < 90) {
+        return $seconds . ' 秒';
+    }
+    if ($seconds < 5400) {
+        return (string)round($seconds / 60) . ' 分钟';
+    }
+    if ($seconds < 172800) {
+        return (string)round($seconds / 3600) . ' 小时';
+    }
+    return (string)round($seconds / 86400) . ' 天';
+}
+
+function human_bytes(int $n): string
+{
+    $u = ['B', 'KB', 'MB', 'GB'];
+    $i = 0;
+    while ($n >= 1024 && $i < 3) {
+        $n = (int)round($n / 1024);
+        $i++;
+    }
+    return $n . $u[$i];
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/js/store-zh.js" Mode="0644"><INLINE><![CDATA[/**
+ * unraid.zh.translator — 前端注入脚本（全局加载）
+ *
+ * 思路：不侵入 Community Applications / dynamix 的源码，只做「文本替换」：
+ *   1. 扫描页面上可见的英文文本节点与 title/placeholder 等属性；
+ *   2. 批量 POST 给本插件后端，命中翻译缓存就直接替换；
+ *   3. 没命中的条目后端会入库并按需调用大模型翻译，回填后再次扫描；
+ *   4. MutationObserver 监听 SPA 重新渲染，新出现的英文同样处理。
+ *
+ * 因为缓存键是「规范化文本」，所以：
+ *   - 插件没更新 → 文案不变 → 直接复用译文，零模型调用；
+ *   - 插件更新了 → 文案变化 → 新键 → 自动重新翻译。
+ */
+(function () {
+    'use strict';
+
+    var CFG = window.__UZT__;
+    if (!CFG || !CFG.enabled) { return; }
+    if (window.__UZT_RUNNING__) { return; }
+    window.__UZT_RUNNING__ = true;
+
+    // ---------------------------------------------------------------- 常量
+    var MIN_LEN = 5;              // 更短的串基本是标识符，性价比低
+    var MAX_LEN = 12000;
+    var BATCH_TEXTS = 48;         // 单次请求最多文本条数
+    var BATCH_CHARS = 8000;       // 单次请求最多字符数
+    var DEBOUNCE_MS = 220;
+    var RETRY_MS = [2500, 5000, 9000, 15000, 25000, 40000];
+
+    var SKIP_SELECTOR = [
+        'script', 'style', 'noscript', 'pre', 'code', 'kbd', 'samp', 'var',
+        'textarea', 'svg', 'math', 'canvas',
+        '.CodeMirror', '.ace_editor', '[contenteditable="true"]',
+        '[data-uzt-skip]', '[translate="no"]', '.uzt-ui'
+    ].join(',');
+
+    var ATTRS = ['title', 'placeholder', 'alt', 'aria-label'];
+
+    // 应用商店（Community Applications / Apps）
+    var STORE_RE = /(^|\/)(Apps|Tools\/CommunityApplications|Settings\/CommunityApplications)(\/|$|\?)/i;
+    // 原生插件页 / Docker 页：只有把范围放大时才处理
+    var PLUGIN_RE = /(^|\/)(Plugins|Settings\/PluginManager)(\/|$|\?)/i;
+    var DOCKER_RE = /(^|\/)(Docker|Settings\/Docker)(\/|$|\?)/i;
+
+    // ---------------------------------------------------------------- 状态
+    var enabled = true;
+    var dict = Object.create(null);      // 原文 => 译文
+    var asked = Object.create(null);     // 已询问过的原文，避免重复
+    var applying = false;
+    var appliedValues = Object.create(null);   // 我们写过的文本，重扫时跳过
+    var originals = new Map();                 // 文本节点 -> 原始英文
+    var attrOriginals = new Map();             // 元素 -> {属性: 原始值}
+    var lang = 'zh';                           // zh | en（右上角切换按钮）
+    var pill = null;
+    var retry = 0;
+    var timer = null;
+    var queuedSeen = 0;
+    var stats = { collected: 0, applied: 0, requests: 0, lastError: '' };
+
+    // ---------------------------------------------------------------- 工具
+
+    var N = window.UZTNorm;
+    if (!N) {
+        if (window.console) { console.warn('[uzt] js/uzt-norm.js 未加载，跳过翻译'); }
+        return;
+    }
+    var norm = N.norm;
+    var hasCJK = N.hasCJK;
+    var looksUntranslatable = N.looksUntranslatable;
+
+    function isCandidate(raw) {
+        return N.isCandidate(raw, { min: MIN_LEN, max: MAX_LEN });
+    }
+
+    function debounce(fn, ms) {
+        var t = null;
+        return function () {
+            clearTimeout(t);
+            t = setTimeout(fn, ms);
+        };
+    }
+
+    function onScope() {
+        try {
+            if (localStorage.getItem('uzt:force') === '1') { return true; }
+            if (localStorage.getItem('uzt:off') === '1') { return false; }
+        } catch (e) { /* 隐私模式 */ }
+        var scope = CFG.scope || 'store';
+        var path = location.pathname + location.search;
+        var inStore = STORE_RE.test(path) || !!document.querySelector(
+            '#ca-app, .ca-app, #community-applications, [data-ca-app], .ca-dashboard'
+        );
+        if (inStore) { return true; }
+        if (scope === 'store') { return false; }
+        if (PLUGIN_RE.test(path)) { return true; }
+        return scope === 'all' && DOCKER_RE.test(path);
+    }
+
+    // ---------------------------------------------------------------- 采集
+
+    function collectFrom(root, bucket) {
+        if (!root) { return; }
+        var walker;
+        try {
+            walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+                acceptNode: function (node) {
+                    var p = node.parentElement;
+                    if (!p) { return NodeFilter.FILTER_REJECT; }
+                    if (p.closest(SKIP_SELECTOR)) { return NodeFilter.FILTER_REJECT; }
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            });
+        } catch (e) { return; }
+
+        var node;
+        while ((node = walker.nextNode())) {
+            var value = node.nodeValue || '';
+            if (appliedValues[value]) { continue; }
+            if (hasCJK(value)) {
+                // 混合语言块（宿主已部分汉化）：只补译其中不含中文的行
+                if (value.length >= 8 && value.indexOf('\n') !== -1) {
+                    var blk = makeBlock(node, value);
+                    if (blk) {
+                        for (var bi = 0; bi < blk.items.length; bi++) {
+                            if (asked[blk.items[bi].key]) { continue; }
+                            bucket.texts.push(blk.items[bi]);
+                        }
+                    }
+                }
+                continue;
+            }
+            var key = isCandidate(value);
+            if (!key) { continue; }
+            if (dict[key] !== undefined) { applyTextNode(node, key); continue; }
+            if (asked[key]) { continue; }
+            bucket.texts.push({ node: node, key: key });
+        }
+
+        var els = root.querySelectorAll ? root.querySelectorAll(ATTRS.map(function (a) { return '[' + a + ']'; }).join(',')) : [];
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (el.closest(SKIP_SELECTOR)) { continue; }
+            for (var a = 0; a < ATTRS.length; a++) {
+                var val = el.getAttribute(ATTRS[a]);
+                if (!val) { continue; }
+                var k = isCandidate(val);
+                if (!k) { continue; }
+                if (dict[k] !== undefined) { el.setAttribute(ATTRS[a], dict[k]); continue; }
+                if (asked[k]) { continue; }
+                bucket.attrs.push({ el: el, attr: ATTRS[a], key: k });
+            }
+        }
+    }
+
+    /**
+     * 混合语言块：把含中文的多行文本按行拆开，只把纯英文行送去翻译，
+     * 全部行都拿到译文后再整体重写（行数与内容位置保持不变）。
+     */
+    function makeBlock(node, value) {
+        var lines = value.split('\n');
+        if (lines.length < 2) { return null; }
+        var items = [];
+        var block = { node: node, lines: lines, resolved: {}, need: 0 };
+        for (var i = 0; i < lines.length; i++) {
+            var k = isCandidate(lines[i]);
+            if (!k) { continue; }
+            block.need++;
+            if (dict[k] !== undefined) {
+                block.resolved[i] = dict[k];
+                continue;
+            }
+            items.push({ node: null, key: k, block: block, idx: i });
+        }
+        if (!block.need || !items.length) { return null; }
+        return { block: block, items: items };
+    }
+
+    function finishBlock(block) {
+        var have = 0;
+        for (var i = 0; i < block.lines.length; i++) {
+            if (block.resolved[i] !== undefined) { have++; }
+        }
+        if (have < block.need) { return; }
+        var out = [];
+        for (var j = 0; j < block.lines.length; j++) {
+            out.push(block.resolved[j] !== undefined ? block.resolved[j] : block.lines[j]);
+        }
+        var text = out.join('\n');
+        if (text === block.node.nodeValue) { return; }
+        appliedValues[text] = 1;
+        applying = true;
+        block.node.nodeValue = text;
+        applying = false;
+        stats.applied++;
+    }
+
+    function applyTextNode(node, key) {
+        var dst = dict[key];
+        if (dst === undefined || dst === '') { return; }
+        if (node.nodeValue === dst) { return; }
+        if (!originals.has(node)) { originals.set(node, node.nodeValue); }
+        applying = true;
+        node.nodeValue = dst;
+        applying = false;
+        stats.applied++;
+    }
+
+    function applyAttr(item) {
+        var dst = dict[item.key];
+        if (dst === undefined || dst === '') { return; }
+        if (!attrOriginals.has(item.el)) { attrOriginals.set(item.el, Object.create(null)); }
+        var bag = attrOriginals.get(item.el);
+        if (bag[item.attr] === undefined) { bag[item.attr] = item.el.getAttribute(item.attr); }
+        applying = true;
+        item.el.setAttribute(item.attr, dst);
+        applying = false;
+        stats.applied++;
+    }
+
+    /** 一键回到英文原文 */
+    function restoreOriginal() {
+        applying = true;
+        originals.forEach(function (orig, node) {
+            try { node.nodeValue = orig; } catch (e) { /* 节点已移除 */ }
+        });
+        attrOriginals.forEach(function (bag, el) {
+            Object.keys(bag).forEach(function (attr) {
+                try { el.setAttribute(attr, bag[attr]); } catch (e) { }
+            });
+        });
+        applying = false;
+        originals.clear();
+        attrOriginals.clear();
+        document.documentElement.removeAttribute('data-uzt-active');
+    }
+
+    function setLang(next, persist) {
+        lang = (next === 'en') ? 'en' : 'zh';
+        if (persist !== false) {
+            try { localStorage.setItem('uzt:lang', lang); } catch (e) { }
+        }
+        if (lang === 'en') {
+            restoreOriginal();
+        } else {
+            asked = Object.create(null);
+            scan(document.body);
+        }
+        updatePill();
+    }
+
+    // ---------------------------------------------------------------- 切换按钮
+
+    function updatePill() {
+        if (!pill) { return; }
+        var zh = pill.querySelector('[data-lang="zh"]');
+        var en = pill.querySelector('[data-lang="en"]');
+        if (!zh || !en) { return; }
+        zh.classList.toggle('on', lang === 'zh');
+        en.classList.toggle('on', lang === 'en');
+        pill.title = '中英文切换（Alt+T）';
+    }
+
+    function buildPill() {
+        if (pill || !document.body) { return; }
+        pill = document.createElement('div');
+        pill.className = 'uzt-ui';
+        pill.id = 'uzt-lang-switch';
+        pill.innerHTML = '<span data-lang="zh">中</span><span data-lang="en">EN</span>';
+        var css = document.createElement('style');
+        css.className = 'uzt-ui';
+        css.textContent = [
+            '#uzt-lang-switch{position:fixed;right:18px;bottom:18px;z-index:2147483000;display:flex;',
+            'background:rgba(0,0,0,.62);border:1px solid rgba(255,255,255,.18);border-radius:999px;',
+            'padding:2px;box-shadow:0 2px 10px rgba(0,0,0,.35);font:600 12px/1 -apple-system,Segoe UI,Roboto,sans-serif;',
+            'cursor:pointer;user-select:none;opacity:.72;transition:opacity .15s}',
+            '#uzt-lang-switch:hover{opacity:1}',
+            '#uzt-lang-switch span{display:block;padding:6px 10px;border-radius:999px;color:#c9c9c9}',
+            '#uzt-lang-switch span.on{background:#ff8c2f;color:#fff}'
+        ].join('');
+        document.head.appendChild(css);
+        pill.addEventListener('click', function (ev) {
+            var t = ev.target && ev.target.getAttribute ? ev.target.getAttribute('data-lang') : null;
+            setLang(t || (lang === 'zh' ? 'en' : 'zh'));
+        });
+        document.body.appendChild(pill);
+        updatePill();
+    }
+
+    // ---------------------------------------------------------------- 通信
+
+    function chunk(list, maxItems, maxChars) {
+        var out = [];
+        var cur = [];
+        var chars = 0;
+        for (var i = 0; i < list.length; i++) {
+            var len = list[i].key.length;
+            if (cur.length && (cur.length >= maxItems || chars + len > maxChars)) {
+                out.push(cur); cur = []; chars = 0;
+            }
+            cur.push(list[i]);
+            chars += len;
+        }
+        if (cur.length) { out.push(cur); }
+        return out;
+    }
+
+    function post(action, payload) {
+        var body = JSON.stringify(payload || {});
+        var headers = { 'Content-Type': 'application/json' };
+        if (CFG.csrf) { headers['X-CSRF-Token'] = CFG.csrf; }
+        var opts = {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: headers,
+            body: body
+        };
+        // 服务端同步翻译可能很慢，给个上限，避免请求永远挂着
+        var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        var timer = null;
+        if (ctrl) {
+            opts.signal = ctrl.signal;
+            timer = setTimeout(function () { try { ctrl.abort(); } catch (e) { } }, 150000);
+        }
+        return fetch(CFG.endpoint + '/' + action + '.php', opts).then(function (r) {
+            return r.json();
+        }).finally(function () {
+            if (timer) { clearTimeout(timer); }
+        });
+    }
+
+    function sendBatch(items, isRetry) {
+        if (!items.length) { return Promise.resolve(); }
+        var texts = [];
+        var seen = Object.create(null);
+        for (var i = 0; i < items.length; i++) {
+            if (seen[items[i].key]) { continue; }
+            seen[items[i].key] = 1;
+            texts.push(items[i].key);
+        }
+        stats.requests++;
+        for (var q = 0; q < items.length; q++) { asked[items[q].key] = 1; }
+        return post('lookup', {
+            texts: texts,
+            csrf: CFG.csrf || '',
+            sync: isRetry ? false : undefined
+        }).then(function (res) {
+            if (!res || res.ok !== true) {
+                stats.lastError = (res && res.error) || 'lookup 失败';
+                for (var z = 0; z < items.length; z++) { delete asked[items[z].key]; }
+                return;
+            }
+            var hits = res.hits || {};
+            for (var k in hits) {
+                if (Object.prototype.hasOwnProperty.call(hits, k)) {
+                    dict[k] = hits[k];
+                }
+            }
+            for (var j = 0; j < items.length; j++) {
+                var it = items[j];
+                if (it.node) {
+                    applyTextNode(it.node, it.key);
+                } else if (it.el) {
+                    applyAttr(it);
+                } else if (it.block) {
+                    it.block.resolved[it.idx] = dict[it.key];
+                    finishBlock(it.block);
+                }
+            }
+            queuedSeen = res.queued || 0;
+            if (res.error) { stats.lastError = res.error; }
+            if (queuedSeen > 0 && Object.keys(hits).length < texts.length) {
+                scheduleRetry();
+            }
+        }).catch(function (e) {
+            stats.lastError = String(e && e.message || e);
+            // 请求失败：允许下次重新尝试同一批文本
+            for (var z = 0; z < items.length; z++) { delete asked[items[z].key]; }
+        });
+    }
+
+    function scheduleRetry() {
+        if (timer || retry >= RETRY_MS.length) { return; }
+        var wait = RETRY_MS[retry++];
+        timer = setTimeout(function () {
+            timer = null;
+            if (document.hidden) { retry--; scheduleRetry(); return; }
+            asked = Object.create(null);
+            scan(document.body);
+        }, wait);
+    }
+
+    var scan = debounce(function (root) {
+        if (!enabled || lang !== 'zh' || !onScope()) { return; }
+        var bucket = { texts: [], attrs: [] };
+        collectFrom(root || document.body, bucket);
+        var items = bucket.texts.concat(bucket.attrs);
+        if (!items.length) { return; }
+        stats.collected += items.length;
+        var isRetryPass = retry > 0;
+        var batches = chunk(items, BATCH_TEXTS, BATCH_CHARS);
+        var chain = Promise.resolve();
+        batches.forEach(function (b) {
+            chain = chain.then(function () { return sendBatch(b, isRetryPass); });
+        });
+        return chain;
+    }, DEBOUNCE_MS);
+
+    // ---------------------------------------------------------------- 启动
+
+    function startObserver() {
+        var mo = new MutationObserver(function (muts) {
+            if (applying) { return; }
+            var worth = false;
+            for (var i = 0; i < muts.length; i++) {
+                var m = muts[i];
+                if (m.type === 'characterData') {
+                    if (m.target && !hasCJK(m.target.nodeValue || '')) {
+                        worth = true;
+                    }
+                } else if (m.addedNodes && m.addedNodes.length) {
+                    for (var j = 0; j < m.addedNodes.length; j++) {
+                        var n = m.addedNodes[j];
+                        if (n.nodeType === 1 || n.nodeType === 3) { worth = true; break; }
+                    }
+                }
+                if (worth) { break; }
+            }
+            if (worth) { scan(document.body); }
+        });
+        mo.observe(document.body, { childList: true, subtree: true, characterData: true });
+    }
+
+    function boot() {
+        if (!onScope()) {
+            // 非目标页面：仍留一个 API 供调试
+            window.uzt = window.uzt || {};
+            return;
+        }
+        try {
+            if (localStorage.getItem('uzt:lang') === 'en') { lang = 'en'; }
+        } catch (e) { }
+        buildPill();
+        if (lang === 'zh') {
+            document.documentElement.setAttribute('data-uzt-active', '1');
+            scan(document.body);
+        } else {
+            updatePill();
+        }
+        document.addEventListener('keydown', function (ev) {
+            if (ev.altKey && (ev.key === 't' || ev.key === 'T')) {
+                ev.preventDefault();
+                setLang(lang === 'zh' ? 'en' : 'zh');
+            }
+        });
+        startObserver();
+        // SPA 路由变化
+        var lastPath = location.pathname;
+        setInterval(function () {
+            if (location.pathname !== lastPath) {
+                lastPath = location.pathname;
+                retry = 0;
+                asked = Object.create(null);
+                setTimeout(function () { scan(document.body); }, 400);
+            }
+        }, 1200);
+        // 页面重新可见时补一次
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) { scan(document.body); }
+        });
+    }
+
+    window.uzt = {
+        version: CFG.version,
+        enable: function () { try { localStorage.removeItem('uzt:off'); } catch (e) { } location.reload(); },
+        disable: function () { try { localStorage.setItem('uzt:off', '1'); } catch (e) { } location.reload(); },
+        forceAllPages: function (v) {
+            try { v ? localStorage.setItem('uzt:force', '1') : localStorage.removeItem('uzt:force'); } catch (e) { }
+            location.reload();
+        },
+        rescan: function () { asked = Object.create(null); scan(document.body); },
+        setLang: function (l) { setLang(l); },
+        lang: function () { return lang; },
+        stats: function () { return stats; },
+        dict: function () { return dict; },
+        config: function () { return CFG; }
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+    } else {
+        boot();
+    }
+})();
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/js/uzt-norm.js" Mode="0644"><INLINE><![CDATA[/**
+ * unraid.zh.translator — 文本规范化（浏览器端）
+ *
+ * 必须与 PHP 侧 UZT\normalize_text() 逐字符一致，否则浏览器算出的键
+ * 会与数据库里的 sha1 对不上，译文永远命中不了。
+ * tests/norm_parity.mjs 会对两边的实现做随机对照。
+ */
+(function (root) {
+    'use strict';
+
+    // 与 PHP UZT\WS_INLINE 完全相同的显式空白集（不要用 \s / trim 的默认语义）
+    var WS_INLINE = /[\t\v\f \u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+/g;
+
+    /** 统一换行 / 折叠行内空白 / 去首尾空白 / 丢弃空行 */
+    function norm(s) {
+        if (typeof s !== 'string') { return ''; }
+        s = s.replace(/\r\n?/g, '\n');
+        var lines = s.split('\n');
+        var out = [];
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].replace(WS_INLINE, ' ').replace(/^ +| +$/g, '');
+            if (line !== '') { out.push(line); }
+        }
+        return out.join('\n');
+    }
+
+    function hasCJK(s) {
+        return /[\u3400-\u9FFF\uF900-\uFAFF]/.test(s);
+    }
+
+    function hasLetter(s) {
+        return /[A-Za-z]/.test(s);
+    }
+
+    /** 不值得翻译：URL、路径、文件名、版本号、全大写常量、标识符/镜像名 */
+    function looksUntranslatable(s) {
+        var t = String(s).trim();
+        if (!t) { return true; }
+        if (/^(https?:\/\/|ftp:\/\/|\/\/|\/[\w./-]*$|[a-z][a-z0-9+.-]*:\/\/)/i.test(t)) { return true; }
+        if (/^[\w./-]+\.(json|xml|ya?ml|js|css|html?|php|sh|png|jpe?g|gif|svg|webp|md|txt|log|db|cfg|ini|plg|txz|tar|gz|zip)$/i.test(t)) { return true; }
+        if (/^(v?\d+(\.\d+)*[a-z0-9.+-]*|\d+(\.\d+)?\s*(kb|mb|gb|tb|ms|s|min|h|%))$/i.test(t)) { return true; }
+        if (/^[A-Z0-9]{2,}$/.test(t)) { return true; }
+        // 去掉句末标点后判断："Requires:" / "Change log:" 这类标签应当翻译
+        var probe = t.replace(/[\s:：,，。.；;]+$/, '') || t;
+        if (!/\s/.test(probe)) {
+            if (/[_/:.+=]|\d/.test(probe)) { return true; }
+            if (probe.length < 5) { return true; }
+        }
+        return !hasLetter(t);
+    }
+
+    /**
+     * @param {string} raw 原始文本
+     * @param {{min?:number,max?:number}} [opts]
+     * @returns {string} 规范化后的键；不值得翻译时返回空串
+     */
+    function isCandidate(raw, opts) {
+        var min = (opts && opts.min) || 5;
+        var max = (opts && opts.max) || 12000;
+        var n = norm(raw);
+        if (n.length < min || n.length > max) { return ''; }
+        if (hasCJK(n)) { return ''; }
+        if (looksUntranslatable(n)) { return ''; }
+        return n;
+    }
+
+    root.UZTNorm = {
+        norm: norm,
+        hasCJK: hasCJK,
+        hasLetter: hasLetter,
+        looksUntranslatable: looksUntranslatable,
+        isCandidate: isCandidate
+    };
+})(typeof window !== 'undefined' ? window : globalThis);
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/scripts/worker.php" Mode="0755"><INLINE><![CDATA[<?php
+/**
+ * unraid.zh.translator — 命令行 worker
+ *
+ * 用法：
+ *   php worker.php sync [--force]      重新抓取应用源并排队（文案变了 = 自动重译）
+ *   php worker.php translate [--seconds=300] [--max=2000]
+ *   php worker.php local               只预热已安装 .plg 的描述
+ *   php worker.php prune               清理已下架应用的历史词条
+ *   php worker.php all                 同步 + 翻译（cron 默认用这个）
+ *   php worker.php cron                给 cron 用：源过期就同步，然后把队列翻完
+ *   php worker.php stats [--json]
+ *   php worker.php test                测试大模型连通性
+ */
+declare(strict_types=1);
+
+namespace UZT;
+
+ini_set('memory_limit', '1024M');
+@set_time_limit(0);
+if (PHP_SAPI !== 'cli') {
+    http_response_code(403);
+    exit("CLI only\n");
+}
+
+require_once __DIR__ . '/../include/translator.php';
+
+// 任何退出路径都保证 JSON 后端落盘
+register_shutdown_function(static function (): void {
+    try {
+        Store::open()->flush();
+    } catch (\Throwable $e) {
+        // 退出阶段不再抛错
+    }
+});
+
+function uzt_cli_opt(string $name, ?string $default = null): ?string
+{
+    global $argv;
+    foreach ($argv ?? [] as $a) {
+        if (str_starts_with($a, '--' . $name . '=')) {
+            return substr($a, strlen($name) + 3);
+        }
+        if ($a === '--' . $name) {
+            return '1';
+        }
+    }
+    return $default;
+}
+
+function uzt_cli_has(string $name): bool
+{
+    return uzt_cli_opt($name) !== null;
+}
+
+$cmd = $argv[1] ?? 'help';
+$json = uzt_cli_has('json');
+
+// 进度既写日志又往 stdout 打：stdout 已被 spawn_worker 重定向到同一个日志文件时
+// 会产生重复行，所以只在终端里才回显。
+$isTty = function_exists('stream_isatty') ? @stream_isatty(STDOUT) : false;
+$progress = ($isTty && !$json)
+    ? static function (string $m): void {
+        echo '  · ' . $m . "\n";
+    }
+    : null;
+
+// 第一行就落日志：便于设置页确认后台任务真的启动了
+jlog(sprintf('worker 启动 pid=%d 命令=%s php=%s',
+    getmypid(),
+    implode(' ', array_slice($argv, 1)),
+    PHP_BINARY !== '' ? PHP_BINARY : '?'), 'INFO', false);
+
+switch ($cmd) {
+    case 'sync':
+        $res = Translator::sync(uzt_cli_has('force'), $progress,
+            uzt_cli_has('no-local') ? false : (Config::get('SCOPE') !== 'store'));
+        uzt_emit($res, $json);
+        exit($res['ok'] ? 0 : 1);
+
+    case 'local':
+        $local = SourceLocal::extract();
+        if (!$local['ok']) {
+            uzt_emit(['ok' => false, 'error' => $local['error'] ?? '读取失败'], $json);
+            exit(1);
+        }
+        $up = Store::open()->upsertSegments($local['segments']);
+        Store::open()->setApps($local['apps']);
+        Store::open()->flush();
+        uzt_emit(['ok' => true, 'added' => $up['added'], 'existed' => $up['existed'], 'plugins' => count($local['apps'])], $json);
+
+        break;
+
+    case 'translate':
+        $res = Translator::translatePending(
+            (int)(uzt_cli_opt('seconds', '300') ?? 300),
+            (int)(uzt_cli_opt('max', '5000') ?? 5000),
+            (int)(uzt_cli_opt('chain', '0') ?? 0)
+        );
+        uzt_emit($res, $json);
+        exit(isset($res['error']) ? 2 : 0);
+
+    case 'all':
+        $s = Translator::sync(uzt_cli_has('force'), $progress);
+        if (!$s['ok']) {
+            uzt_emit($s, $json);
+            exit(1);
+        }
+        $t = Translator::translatePending((int)(uzt_cli_opt('seconds', '600') ?? 600), 20000);
+        uzt_emit(['ok' => true, 'sync' => $s, 'translate' => $t], $json);
+        break;
+
+    case 'cron':
+        $store = Store::open();
+        $last = (int)$store->getMeta('synced_at', '0');
+        $need = (time() - $last) > max(3600, Config::int('FEED_CACHE_TTL', 21600));
+        if ($need) {
+            $s = Translator::sync(false, $progress);
+            if (!$s['ok']) {
+                jlog('cron 同步失败: ' . (string)($s['error'] ?? ''), 'WARN');
+            }
+        }
+        $t = Translator::translatePending(max(60, Config::int('WORKER_SECONDS', 300)), 20000);
+        uzt_emit(['ok' => true, 'synced' => $need, 'translate' => $t], $json);
+        break;
+
+    case 'compact':
+        uzt_emit(Translator::compact(), $json);
+        break;
+
+    case 'retry-failed':
+        $n = Store::open()->resetFailed();
+        Store::open()->flush();
+        uzt_emit(['ok' => true, 'reset' => $n], $json);
+        break;
+
+    case 'prune':
+        uzt_emit(Translator::prune(), $json);
+        break;
+
+    case 'test':
+        $llm = new Llm();
+        uzt_emit($llm->test(), $json);
+        break;
+
+    case 'stats':
+    default:
+        $store = Store::open();
+        $payload = [
+            'ok' => true,
+            'config' => [
+                'model' => Config::get('MODEL'),
+                'base' => Config::get('API_BASE'),
+                'key_set' => Config::get('API_KEY') !== '',
+                'enabled' => Config::bool('ENABLED'),
+            ],
+            'stats' => $store->stats(),
+            'estimate' => Translator::estimate(),
+            'worker_running' => Translator::workerRunning(),
+            'meta' => [
+                'synced_at' => $store->getMeta('synced_at'),
+                'feed_updated' => $store->getMeta('feed_updated'),
+                'feed_apps' => $store->getMeta('feed_apps'),
+                'plugins' => $store->getMeta('plugins'),
+            ],
+            'recent' => $store->recentEvents(10),
+        ];
+        if ($cmd === 'help' && !$json) {
+            echo "unraid.zh.translator worker\n";
+            echo "用法: php worker.php <sync|translate|local|prune|all|cron|stats|test|retry-failed|compact> [--json] [--force] [--seconds=N]\n";
+            break;
+        }
+        uzt_emit($payload, true);
+        break;
+}
+
+function uzt_emit(array $payload, bool $json = true): void
+{
+    $flags = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES;
+    echo json_encode($payload, $json ? ($flags | JSON_PRETTY_PRINT) : $flags) . "\n";
+}
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/store-zh-inject.page" Mode="0755"><INLINE><![CDATA[Menu='Buttons'
+Link='nav-user'
+---
+<?php
+/**
+ * unraid.zh.translator — 全局注入点
+ *
+ * Unraid 的 webGui 会把所有 Menu='Buttons' 的 .page 渲染进顶栏，
+ * 因此这段 PHP 在每一个 WebUI 页面上都会执行 —— 我们只在这里挂两个脚本：
+ *   1) ajax/configjs.php  运行时配置（开关、范围、CSRF）
+ *   2) js/store-zh.js     文本替换引擎（内部会判断当前页面是否需要工作）
+ *
+ * 不做任何 DOM 改写、不覆盖任何宿主插件文件，卸载即恢复原样。
+ */
+require_once '/usr/local/emhttp/plugins/unraid.zh.translator/include/util.php';
+
+if (!\UZT\Config::bool('ENABLED')) {
+    return;
+}
+$base = '/plugins/unraid.zh.translator';
+$stamp = (string)@filemtime('/usr/local/emhttp/plugins/unraid.zh.translator/js/store-zh.js');
+if ($stamp === '') {
+    $stamp = \UZT\VERSION;
+}
+?>
+<script src="<?= $base ?>/ajax/configjs.php?v=<?= $stamp ?>"></script>
+<script src="<?= $base ?>/js/uzt-norm.js?v=<?= $stamp ?>"></script>
+<script src="<?= $base ?>/js/store-zh.js?v=<?= $stamp ?>" defer></script>
+]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/unraid.zh.translator.page" Mode="0755"><INLINE><![CDATA[Menu="Settings"
+Title="插件中文化"
+Icon="language"
+---
+<?php
+/**
+ * unraid.zh.translator — 设置页
+ */
+require_once '/usr/local/emhttp/plugins/unraid.zh.translator/include/translator.php';
+
+$cfg   = \UZT\Config::all();
+$csrf  = \UZT\csrf_token();
+$keySet = $cfg['API_KEY'] !== '';
+$stats = \UZT\Store::open()->stats();
+$meta  = [
+    'synced_at'    => \UZT\Store::open()->getMeta('synced_at'),
+    'feed_updated' => \UZT\Store::open()->getMeta('feed_updated'),
+    'feed_apps'    => \UZT\Store::open()->getMeta('feed_apps'),
+    'plugins'      => \UZT\Store::open()->getMeta('plugins'),
+];
+$h = static fn($v) => htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8');
+$sel = static function (string $key, array $opts) use ($cfg): string {
+    $out = '';
+    foreach ($opts as $val => $label) {
+        $out .= '<option value="' . htmlspecialchars($val, ENT_QUOTES) . '"'
+            . ($cfg[$key] === (string)$val ? ' selected' : '') . '>' . htmlspecialchars($label, ENT_QUOTES) . '</option>';
+    }
+    return $out;
+};
+?>
+<style>
+.uzt{max-width:1120px}
+.uzt .card{border:1px solid rgba(127,127,127,.35);border-radius:8px;padding:16px 18px;margin:0 0 16px}
+.uzt .card h3{margin:0 0 10px;font-size:1.05em;display:flex;align-items:center;gap:8px}
+.uzt .muted{opacity:.65;font-size:.9em;line-height:1.6}
+.uzt .tabs{display:flex;gap:6px;margin:0 0 16px;flex-wrap:wrap}
+.uzt .tabs button{border:1px solid rgba(127,127,127,.35);background:rgba(127,127,127,.10);color:inherit;
+  padding:8px 16px;border-radius:6px;cursor:pointer;font-size:.95em}
+.uzt .tabs button.on{background:#ff8c2f;border-color:#ff8c2f;color:#fff;font-weight:600}
+.uzt .panel{display:none}
+.uzt .panel.on{display:block}
+.uzt .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:10px 0 4px}
+.uzt .stat{border:1px solid rgba(127,127,127,.3);border-radius:8px;padding:10px 12px;background:rgba(127,127,127,.07)}
+.uzt .stat .n{font-size:1.5em;font-weight:700;line-height:1.2}
+.uzt .stat .l{font-size:.82em;opacity:.7}
+.uzt .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}
+.uzt button.act{border:1px solid rgba(127,127,127,.4);background:rgba(127,127,127,.12);color:inherit;
+  padding:9px 16px;border-radius:6px;cursor:pointer;font-size:.92em}
+.uzt button.act:hover{background:rgba(127,127,127,.2)}
+.uzt button.primary{background:#ff8c2f;border-color:#ff8c2f;color:#fff;font-weight:600}
+.uzt button.primary:hover{filter:brightness(1.06)}
+.uzt button.danger{background:rgba(200,60,60,.18);border-color:rgba(200,60,60,.55);color:#e6787a}
+.uzt .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.78em;
+  border:1px solid rgba(127,127,127,.4);background:rgba(127,127,127,.12)}
+.uzt .badge.ok{border-color:rgba(60,170,90,.6);color:#4caf50;background:rgba(60,170,90,.12)}
+.uzt .badge.warn{border-color:rgba(220,160,40,.6);color:#e0a028;background:rgba(220,160,40,.12)}
+.uzt pre.log{background:#0b0b0b;color:#42d97a;border:1px solid #1d3b25;border-radius:6px;padding:12px;
+  max-height:420px;overflow:auto;font-size:12px;line-height:1.5;white-space:pre-wrap;margin:0}
+.uzt table.kinds{width:100%;border-collapse:collapse;font-size:.9em}
+.uzt table.kinds td,.uzt table.kinds th{padding:6px 8px;border-bottom:1px solid rgba(127,127,127,.25);text-align:left}
+.uzt .bar{height:8px;border-radius:99px;background:rgba(127,127,127,.2);overflow:hidden;margin:8px 0}
+.uzt .bar > i{display:block;height:100%;background:#ff8c2f;width:0}
+.uzt dl dt{font-weight:600}
+.uzt .inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+</style>
+
+<div class="uzt" id="uzt">
+  <div class="tabs">
+    <button data-tab="overview" class="on">概览</button>
+    <button data-tab="model">大模型</button>
+    <button data-tab="dict">词典与任务</button>
+    <button data-tab="log">日志</button>
+  </div>
+
+  <!-- ============================ 概览 ============================ -->
+  <div class="panel on" data-panel="overview">
+    <div class="card">
+      <h3><i class="fa fa-language"></i> 插件中文化 · 状态</h3>
+      <p class="muted">
+        本插件把 <b>Community Applications（应用/插件商店）</b> 与 <b>已安装插件</b> 页面里的英文文案
+        在浏览器端替换为中文。译文按「文本内容哈希」缓存：<b>插件没更新就复用旧译文</b>；
+        文案变了（插件更新、说明改动）会生成新哈希，<b>只重译变化的那几段</b>。
+      </p>
+      <div class="grid">
+        <div class="stat"><div class="n" id="s-done"><?= (int)$stats['done'] ?></div><div class="l">已翻译片段</div></div>
+        <div class="stat"><div class="n" id="s-pending"><?= (int)$stats['pending'] ?></div><div class="l">待翻译</div></div>
+        <div class="stat"><div class="n" id="s-total"><?= (int)$stats['total'] ?></div><div class="l">词条总数</div></div>
+        <div class="stat"><div class="n" id="s-failed"><?= (int)$stats['failed'] ?></div><div class="l">失败片段</div></div>
+        <div class="stat"><div class="n" id="s-chars"><?= number_format((int)$stats['src_chars']) ?></div><div class="l">已译原文字符</div></div>
+        <div class="stat"><div class="n" id="s-bytes"><?= \UZT\human_bytes((int)$stats['db_bytes']) ?></div><div class="l">词库占用</div></div>
+      </div>
+      <div class="bar"><i id="s-bar" style="width:<?= $stats['total'] > 0 ? round($stats['done'] * 100 / $stats['total'], 1) : 0 ?>%"></i></div>
+      <p class="muted" id="env-line">环境自检：—</p>
+      <p class="muted">
+        存储后端 <span class="badge" id="s-backend"><?= $h($stats['backend']) ?></span>
+        · 上次同步 <span id="s-synced"><?= $meta['synced_at'] ? $h(date('Y-m-d H:i', (int)$meta['synced_at'])) : '从未' ?></span>
+        · 应用源更新于 <span id="s-feedupd"><?= $meta['feed_updated'] ? $h($meta['feed_updated']) : '—' ?></span>
+        · 商店应用 <span id="s-feedapps"><?= $h($meta['feed_apps'] ?: '—') ?></span> 个
+        · 本地插件 <span id="s-plugins"><?= $h($meta['plugins'] ?: '—') ?></span> 个
+      </p>
+    </div>
+
+    <div class="card">
+      <h3><i class="fa fa-toggle-on"></i> 开关与生效范围</h3>
+      <dl>
+        <dt>启用翻译</dt>
+        <dd>
+          <select id="ENABLED" class="input">
+            <option value="1" <?= $cfg['ENABLED'] === '1' ? 'selected' : '' ?>>启用</option>
+            <option value="0" <?= $cfg['ENABLED'] === '0' ? 'selected' : '' ?>>停用</option>
+          </select>
+          <span class="muted">停用后浏览器端不再做任何替换。</span>
+        </dd>
+        <dt>生效页面</dt>
+        <dd>
+          <select id="SCOPE" class="input"><?= $sel('SCOPE', [
+              'store' => '仅应用商店（Apps / Community Applications）— 推荐',
+              'store_plugins' => '应用商店 + 原生插件页（Plugins）',
+              'all' => '应用商店 + 插件页 + Docker 页',
+          ]) ?></select>
+        </dd>
+        <dt>自动翻译新文案</dt>
+        <dd>
+          <select id="AUTO_NEW" class="input">
+            <option value="1" <?= $cfg['AUTO_NEW'] === '1' ? 'selected' : '' ?>>自动（看到没译过的英文就翻）</option>
+            <option value="0" <?= $cfg['AUTO_NEW'] === '0' ? 'selected' : '' ?>>只用已有译文</option>
+          </select>
+          <span class="muted">关闭后，只有手动「同步 + 翻译队列」才会产生新译文。</span>
+        </dd>
+        <dt>页面加载即翻译</dt>
+        <dd>
+          <select id="SYNC_ON_LOOKUP" class="input">
+            <option value="1" <?= $cfg['SYNC_ON_LOOKUP'] === '1' ? 'selected' : '' ?>>是（当前页立等译文）</option>
+            <option value="0" <?= $cfg['SYNC_ON_LOOKUP'] === '0' ? 'selected' : '' ?>>否（先入队，后台慢慢翻）</option>
+          </select>
+          <span class="muted">手动关闭时浏览器仍会显示已缓存的译文，未译的保持英文，等后台任务补齐。</span>
+        </dd>
+        <dt>单次同步翻译上限</dt>
+        <dd><input type="text" id="SYNC_MAX_CHARS" class="input" size="10" value="<?= $h($cfg['SYNC_MAX_CHARS']) ?>">
+          <span class="muted">字符。超过就先入队，避免页面等待过久。</span></dd>
+        <dt>每小时同步翻译预算</dt>
+        <dd><input type="text" id="HOURLY_CHAR_BUDGET" class="input" size="10" value="<?= $h($cfg['HOURLY_CHAR_BUDGET']) ?>">
+          <span class="muted">字符/小时，0 = 不限。超出后新文案只入队，由「翻译待译队列」或 cron 处理。</span></dd>
+      </dl>
+      <div class="row">
+        <button class="act primary" data-act="save"><i class="fa fa-save"></i> 保存设置</button>
+        <span id="save-hint" class="muted"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================ 大模型 ============================ -->
+  <div class="panel" data-panel="model">
+    <div class="card">
+      <h3><i class="fa fa-microchip"></i> 大模型接口（OpenAI 兼容）</h3>
+      <p class="muted">
+        支持任何实现 <code>/v1/chat/completions</code> 的服务：OpenAI、DeepSeek、Moonshot、智谱、
+        硅基流动、one-api/NewAPI 中转，以及本地 <code>Ollama</code>（地址填 <code>http://IP:11434/v1</code>）、
+        LM Studio（<code>http://IP:1234/v1</code>）、vLLM 等。<br>
+        密钥只保存在本机 <code>/boot/config/plugins/unraid.zh.translator/translator.cfg</code>（权限 600），不会回传到浏览器。
+      </p>
+      <dl>
+        <dt>API 地址</dt>
+        <dd><input type="text" id="API_BASE" class="input" size="52" value="<?= $h($cfg['API_BASE']) ?>"
+              placeholder="https://api.deepseek.com/v1"></dd>
+        <dt>API Key</dt>
+        <dd class="inline">
+          <input type="password" id="API_KEY" class="input" size="52"
+                 placeholder="<?= $keySet ? '已保存，留空表示不修改' : 'sk-... / ollama 可留空' ?>">
+          <label class="muted"><input type="checkbox" id="API_KEY_CLEAR"> 清除已保存的密钥</label>
+        </dd>
+        <dt>模型</dt>
+        <dd><input type="text" id="MODEL" class="input" size="32" value="<?= $h($cfg['MODEL']) ?>"
+              placeholder="deepseek-chat / gpt-4o-mini / qwen2.5:14b"></dd>
+        <dt>JSON 模式</dt>
+        <dd><select id="JSON_MODE" class="input"><?= $sel('JSON_MODE', ['auto' => 'auto（失败自动降级）', 'on' => '强制开启', 'off' => '关闭']) ?></select></dd>
+        <dt>温度</dt>
+        <dd><input type="text" id="TEMPERATURE" class="input" size="6" value="<?= $h($cfg['TEMPERATURE']) ?>"></dd>
+        <dt>每请求条数 / 字符</dt>
+        <dd class="inline">
+          <input type="text" id="BATCH_ITEMS" class="input" size="5" value="<?= $h($cfg['BATCH_ITEMS']) ?>">
+          <input type="text" id="BATCH_CHARS" class="input" size="7" value="<?= $h($cfg['BATCH_CHARS']) ?>">
+        </dd>
+        <dt>PHP CLI 路径</dt>
+        <dd><input type="text" id="PHP_CLI" class="input" size="30" value="<?= $h($cfg['PHP_CLI']) ?>"
+              placeholder="留空自动探测（/usr/bin/php）">
+          <span class="muted">只有「后台任务启动失败」时才需要手填。</span></dd>
+        <dt>超时 / 重试</dt>
+        <dd class="inline">
+          <input type="text" id="TIMEOUT" class="input" size="5" value="<?= $h($cfg['TIMEOUT']) ?>"> 秒
+          <input type="text" id="RETRIES" class="input" size="4" value="<?= $h($cfg['RETRIES']) ?>"> 次
+        </dd>
+      </dl>
+      <div class="row">
+        <button class="act primary" data-act="save"><i class="fa fa-save"></i> 保存设置</button>
+        <button class="act" data-act="test"><i class="fa fa-vial"></i> 测试连接</button>
+        <span id="test-hint" class="muted"></span>
+      </div>
+      <div id="test-out" class="muted" style="margin-top:8px;white-space:pre-wrap"></div>
+    </div>
+  </div>
+
+  <!-- ============================ 词典与任务 ============================ -->
+  <div class="panel" data-panel="dict">
+    <div class="card">
+      <h3><i class="fa fa-database"></i> 同步与翻译任务</h3>
+      <p class="muted">
+        一次「同步」会下载应用源（约 20MB），抽出简介/要求/分类/字段说明等片段并按内容哈希去重；
+        只有哈希没见过的片段才会进入待译队列，所以<b>重复同步几乎零成本</b>。
+      </p>
+      <div class="row">
+        <button class="act primary" data-act="sync"><i class="fa fa-cloud-download"></i> 同步应用源</button>
+        <button class="act" data-act="sync" data-force="1"><i class="fa fa-refresh"></i> 强制重新下载</button>
+        <button class="act" data-act="translate"><i class="fa fa-language"></i> 翻译待译队列</button>
+        <span class="muted" id="auto-continue-hint">到达时间预算后会自动续跑</span>
+        <button class="act" data-act="retry-failed"><i class="fa fa-rotate-right"></i> 重试失败片段</button>
+        <button class="act" data-act="compact"><i class="fa fa-filter"></i> 精简队列（只保留简介类）</button>
+        <button class="act" data-act="drop-pending"><i class="fa fa-scissors"></i> 清空未译队列（改为纯按需）</button>
+        <button class="act" data-act="prune"><i class="fa fa-eraser"></i> 清理已下架词条</button>
+        <span id="task-hint" class="muted"></span>
+      </div>
+      <div class="row">
+        <button class="act danger" data-act="wipe"><i class="fa fa-trash"></i> 清空全部译文重新开始</button>
+        <button class="act danger" data-act="defaults"><i class="fa fa-undo"></i> 恢复默认设置</button>
+      </div>
+      <p class="muted" id="est-line">—</p>
+      <p class="muted" id="fail-line" style="display:none"></p>
+      <p class="muted" id="worker-state">后台任务状态：空闲</p>
+    </div>
+
+    <div class="card">
+      <h3><i class="fa fa-clock-o"></i> 定时任务</h3>
+      <dl>
+        <dt>应用源</dt>
+        <dd><select id="FEED_SOURCE" class="input"><?= $sel('FEED_SOURCE', [
+            'auto' => '自动：优先复用 CA 本地缓存（推荐）',
+            'local' => '仅用 CA 本地缓存（离线可用，需先打开一次 Apps 页）',
+            'online' => '仅在线下载',
+        ]) ?></select>
+          <span class="muted">CA 插件把应用源放在 <code>/tmp/GitHub/AppFeed/applicationFeed.json</code>，
+            本插件直接复用它，并在时间戳过期时才去官方 CDN 拉取。</span></dd>
+        <dt>在线源地址</dt>
+        <dd><input type="text" id="FEED_URL" class="input" size="60" value="<?= $h($cfg['FEED_URL']) ?>">
+          <span class="muted">默认官方 <code>assets.ca.unraid.net</code>，失败会自动退回 GitHub 备份。</span></dd>
+        <dt>Cron</dt>
+        <dd class="inline">
+          <input type="text" id="CRON" class="input" size="18" value="<?= $h($cfg['CRON']) ?>" placeholder="0 4 * * *">
+          <span class="muted">5 段格式；留空=关闭。建议每天一次，自动同步并把队列翻完。</span>
+        </dd>
+        <dt>单次运行预算</dt>
+        <dd><input type="text" id="WORKER_SECONDS" class="input" size="6" value="<?= $h($cfg['WORKER_SECONDS']) ?>"> 秒
+          <span class="muted">超过就停，下次继续。</span></dd>
+      </dl>
+      <div class="row"><button class="act primary" data-act="save"><i class="fa fa-save"></i> 保存设置</button></div>
+    </div>
+
+    <div class="card">
+      <h3><i class="fa fa-list-ol"></i> 分类覆盖率</h3>
+      <table class="kinds">
+        <thead><tr><th>片段类型</th><th>总数</th><th>已译</th><th>覆盖率</th></tr></thead>
+        <tbody id="kinds-body"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ============================ 日志 ============================ -->
+  <div class="panel" data-panel="log">
+    <div class="card">
+      <h3><i class="fa fa-terminal"></i> 运行日志</h3>
+      <pre class="log" id="log-box">加载中…</pre>
+      <div class="row">
+        <button class="act" data-act="refresh"><i class="fa fa-refresh"></i> 刷新</button>
+        <label class="muted"><input type="checkbox" id="auto-refresh" checked> 自动刷新（3 秒）</label>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var CSRF = <?= json_encode($csrf, JSON_HEX_TAG | JSON_HEX_AMP) ?>;
+  var API = '/plugins/unraid.zh.translator/ajax';
+  var FIELDS = ['ENABLED','SCOPE','AUTO_NEW','SYNC_ON_LOOKUP','SYNC_MAX_CHARS','HOURLY_CHAR_BUDGET','PHP_CLI','FEED_SOURCE','FEED_URL',
+    'API_BASE','MODEL','JSON_MODE','TEMPERATURE','BATCH_ITEMS','BATCH_CHARS','TIMEOUT','RETRIES',
+    'CRON','WORKER_SECONDS'];
+
+  function $(id) { return document.getElementById(id); }
+  function post(action, extra) {
+    var body = Object.assign({ action: action, csrf: CSRF }, extra || {});
+    return fetch(API + '/settings.php', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); });
+  }
+  function get(action, extra) {
+    var q = new URLSearchParams(Object.assign({ csrf: CSRF }, extra || {}));
+    return fetch(API + '/' + action + '.php?' + q.toString(), { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); });
+  }
+  function hint(el, text, cls) {
+    if (typeof el === 'string') { el = $(el); }
+    if (!el) { return; }
+    el.textContent = text || '';
+    el.className = 'muted' + (cls ? ' ' + cls : '');
+  }
+  function collect() {
+    var cfg = {};
+    FIELDS.forEach(function (f) { if ($(f)) { cfg[f] = $(f).value; } });
+    var keyInput = $('API_KEY');
+    if (keyInput && keyInput.value.trim() !== '') { cfg.API_KEY = keyInput.value.trim(); }
+    return cfg;
+  }
+  function save(silent) {
+    var payload = { config: collect() };
+    if ($('API_KEY_CLEAR') && $('API_KEY_CLEAR').checked) { payload.clear_key = true; }
+    return post('save', payload).then(function (res) {
+      if (!res.ok) { hint('save-hint', '保存失败：' + (res.error || ''), 'warn'); return res; }
+      if (!res.ok && res.error) {
+        hint('save-hint', '保存失败：' + res.error, 'warn');
+        return res;
+      }
+      var msg = '已保存';
+      if (res.errors && res.errors.length) { msg += '（提示：' + res.errors.join('；') + '）'; }
+      if (res.cron_changed) { msg += ' · Cron 已重载'; }
+      if (!silent) { hint('save-hint', msg, 'ok'); setTimeout(function(){ hint('save-hint',''); }, 4000); }
+      if ($('API_KEY')) { $('API_KEY').value = ''; }
+      if ($('API_KEY_CLEAR')) { $('API_KEY_CLEAR').checked = false; }
+      return res;
+    });
+  }
+
+  // 标签页
+  document.querySelectorAll('.uzt .tabs button').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.querySelectorAll('.uzt .tabs button').forEach(function (b) { b.classList.remove('on'); });
+      document.querySelectorAll('.uzt .panel').forEach(function (p) { p.classList.remove('on'); });
+      btn.classList.add('on');
+      var p = document.querySelector('.uzt .panel[data-panel="' + btn.dataset.tab + '"]');
+      if (p) { p.classList.add('on'); }
+      if (btn.dataset.tab === 'log') { refresh(); }
+    });
+  });
+
+  // 按钮
+  document.querySelectorAll('.uzt button.act').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var act = btn.dataset.act;
+      if (act === 'save') { save(false); return; }
+      if (act === 'test') {
+        hint('test-hint', '测试中…');
+        $('test-out').textContent = '';
+        save(true).then(function () {
+          return post('test');
+        }).then(function (res) {
+          var r = res.result || res;
+          if (r.ok) {
+            hint('test-hint', '连接正常（' + r.ms + ' ms）', 'ok');
+            $('test-out').textContent = '模型 ' + r.model + '\n原文：' + r.sample_src + '\n译文：' + r.sample_dst;
+          } else {
+            hint('test-hint', '失败：' + (r.error || res.error || '未知错误'), 'warn');
+          }
+        }).catch(function (e) { hint('test-hint', '请求异常：' + e, 'warn'); });
+        return;
+      }
+      if (act === 'refresh') { refresh(); return; }
+      if (act === 'wipe' && !confirm('将清空全部已保存译文（不影响设置），确定吗？')) { return; }
+      if (act === 'drop-pending' && !confirm('将删除所有「未翻译」的条目，之后只在你浏览页面时按需翻译（已译的保留）。确定吗？')) { return; }
+      if (act === 'defaults' && !confirm('恢复默认设置（含清空 API Key）？译文缓存不会动。')) { return; }
+      btn.disabled = true;
+      var extra = btn.dataset.force ? { force: 1 } : {};
+      hint('task-hint', '执行中…');
+      post(act, extra).then(function (res) {
+        btn.disabled = false;
+        if (act === 'save') { return; }
+        if (!res.ok) { hint('task-hint', '失败：' + (res.error || ''), 'warn'); return; }
+        if (act === 'sync' || act === 'translate') {
+          hint('task-hint', '已启动后台任务，进度见下方日志', 'ok');
+        } else if (act === 'drop-pending') {
+          hint('task-hint', '已清空未译队列（删除 ' + (res.removed || 0) + ' 条），之后按需翻译', 'ok');
+        } else if (act === 'compact') {
+          hint('task-hint', '已删除 ' + (res.removed || 0) + ' 条短文本/本机插件片段（阈值 ' + (res.min_chars || 0) + ' 字符）', 'ok');
+        } else if (act === 'retry-failed') {
+          hint('task-hint', '已把 ' + (res.reset || 0) + ' 条失败片段放回队列', 'ok');
+        } else if (act === 'prune') {
+          hint('task-hint', '已清理 ' + (res.result ? res.result.removed : 0) + ' 条过期词条', 'ok');
+        } else if (act === 'wipe') {
+          hint('task-hint', '译文已清空', 'ok');
+        } else if (act === 'defaults') {
+          hint('task-hint', '已恢复默认，请刷新页面', 'ok');
+        }
+        refresh();
+      }).catch(function (e) {
+        btn.disabled = false;
+        hint('task-hint', '请求异常：' + e, 'warn');
+      });
+    });
+  });
+
+  // 状态轮询
+  function fmt(n) { return (n === null || n === undefined) ? '—' : Number(n).toLocaleString(); }
+  function humanDur(sec) {
+    if (!sec || sec < 0) { return '—'; }
+    if (sec < 90) { return sec + ' 秒'; }
+    if (sec < 5400) { return Math.round(sec / 60) + ' 分钟'; }
+    return (sec / 3600).toFixed(1) + ' 小时';
+  }
+  function kindName(k) {
+    var map = { overview: '应用简介', requires: '运行要求', cat: '分类名称', field: '模板字段说明',
+      fieldname: '模板字段名', branch: '分支说明', note: '应用备注',
+      localdesc: '本地插件描述', localchg: '本地插件更新日志', live: '页面即时采集', '': '未分类' };
+    return map[k] || k;
+  }
+  var lastRev = null;
+  function refresh() {
+    if (document.hidden) { return Promise.resolve(); }
+    var light = (lastRev !== null);
+    return get('status', light ? { light: 1 } : {}).then(function (res) {
+      if (!res.ok) { return; }
+      if (light && res.revision !== undefined && String(res.revision) === String(lastRev)) {
+        $('worker-state').textContent = '后台任务状态：' + (res.worker_running ? '运行中…' : '空闲');
+        return;
+      }
+      lastRev = (res.stats && res.stats.revision) || res.revision || null;
+      var s = res.stats || {};
+      $('s-done').textContent = fmt(s.done);
+      $('s-pending').textContent = fmt(s.pending);
+      $('s-total').textContent = fmt(s.total);
+      $('s-failed').textContent = fmt(s.failed);
+      $('s-chars').textContent = fmt(s.src_chars);
+      var pct = s.total > 0 ? Math.round(s.done * 1000 / s.total) / 10 : 0;
+      $('s-bar').style.width = pct + '%';
+      $('s-backend').textContent = s.backend || '—';
+      if (res.meta) {
+        $('s-synced').textContent = res.meta.synced_at ? new Date(res.meta.synced_at * 1000).toLocaleString() : '从未';
+        $('s-feedupd').textContent = res.meta.feed_updated || '—';
+        $('s-feedapps').textContent = res.meta.feed_apps || '—';
+        $('s-plugins').textContent = res.meta.plugins || '—';
+      }
+      // 词库占用（字节）
+      var by = document.getElementById('s-bytes');
+      if (by && typeof s.db_bytes === 'number') {
+        var u = ['B','KB','MB','GB'], n = s.db_bytes, i = 0;
+        while (n >= 1024 && i < 3) { n = Math.round(n / 1024); i++; }
+        by.textContent = n + u[i];
+      }
+      if (res.failures && res.failures.length) {
+        var fl = document.getElementById('fail-line');
+        if (fl) {
+          fl.style.display = '';
+          fl.textContent = '最近失败原因：' + res.failures.map(function (f) {
+            return (f.err || '未知').slice(0, 60) + ' ×' + f.n;
+          }).join(' · ') + '（修好后点「重试失败片段」）';
+        }
+      }
+      if (res.env) {
+        var e2 = res.env;
+        var bits2 = [];
+        bits2.push('PHP CLI ' + (e2.php_cli || '未找到'));
+        bits2.push('日志目录' + (e2.log_writable ? '可写' : '不可写'));
+        bits2.push('/boot' + (e2.boot_writable ? '可写' : '不可写'));
+        if (e2.ca_local && e2.ca_local.file) {
+          bits2.push('CA 本地源 ' + humanDur(e2.ca_local.age) + '前');
+        } else {
+          bits2.push('未发现 CA 本地源');
+        }
+        if (e2.feed_source) {
+          var srcName = { 'ca-local': 'CA 本地缓存', 'cdn': '官方 CDN', 'github': 'GitHub 备份', 'own-cache': '本地下载缓存', 'custom': '自定义源' };
+          bits2.push('上次同步用 ' + (srcName[e2.feed_source] || e2.feed_source));
+        }
+        var el2 = document.getElementById('env-line');
+        if (el2) {
+          el2.textContent = '环境自检：' + bits2.join(' · ');
+          if (!e2.log_writable || !e2.boot_writable || !e2.php_cli) {
+            el2.style.color = '#e0a028';
+          }
+        }
+      }
+      if (res.estimate) {
+        var e = res.estimate;
+        var bits = ['待译 ' + fmt(e.pending) + ' 条', '约 ' + fmt(e.pending_chars) + ' 字符',
+          '约 ' + fmt(e.requests) + ' 次请求'];
+        if (e.avg_req_ms > 0) {
+          bits.push('按上轮实测 ' + e.avg_req_ms + ' ms/次，预计 ' + humanDur(e.eta_seconds));
+        }
+        var line = document.getElementById('est-line');
+        if (line) { line.textContent = '队列估算：' + bits.join(' · '); }
+      }
+      $('worker-state').textContent = '后台任务状态：' + (res.worker_running ? '运行中…' : '空闲')
+        + ' · 待译 ' + fmt(s.pending) + ' 条';
+      var tb = $('kinds-body');
+      if (tb && res.kinds) {
+        tb.innerHTML = res.kinds.map(function (k) {
+          var p = k.total > 0 ? Math.round(k.done * 1000 / k.total) / 10 : 0;
+          return '<tr><td>' + kindName(k.kind) + '</td><td>' + fmt(k.total) + '</td><td>' + fmt(k.done)
+            + '</td><td>' + p + '%</td></tr>';
+        }).join('') || '<tr><td colspan="4" class="muted">暂无数据，先点「同步应用源」</td></tr>';
+      }
+      if ($('auto-refresh') && $('auto-refresh').checked) {
+        var box = $('log-box');
+        var atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+        box.textContent = res.log || '（暂无日志）';
+        if (atBottom) { box.scrollTop = box.scrollHeight; }
+      }
+    }).catch(function () { /* 静默 */ });
+  }
+
+  refresh();
+  setInterval(refresh, 3000);
+})();
+</script>
+]]></INLINE></FILE>
+
+<FILE Run="/bin/bash">
+<INLINE>
+# 权限与运行目录
+chmod -R a+r /usr/local/emhttp/plugins/unraid.zh.translator
+find /usr/local/emhttp/plugins/unraid.zh.translator -type d -exec chmod 0775 {} \;
+chmod 0755 /usr/local/emhttp/plugins/unraid.zh.translator/scripts/worker.php 2>/dev/null
+mkdir -p /usr/local/emhttp/plugins/unraid.zh.translator/var
+chmod 0775 /usr/local/emhttp/plugins/unraid.zh.translator/var
+# 默认配置（不存在才写，避免覆盖用户设置）
+CFG=/boot/config/plugins/unraid.zh.translator/translator.cfg
+if [ ! -f "$CFG" ]; then
+  /usr/bin/php -r 'require "/usr/local/emhttp/plugins/unraid.zh.translator/include/util.php"; require "/usr/local/emhttp/plugins/unraid.zh.translator/include/config.php"; UZT\Config::write(UZT\Config::DEFAULTS);' 2>/dev/null || true
+fi
+# 首次安装提示
+echo
+echo "----------------------------------------------------------"
+echo " 插件中文化已安装。"
+echo " 1. 打开 设置 → 插件中文化，填写大模型 API（或本地 Ollama）"
+echo " 2. 点「测试连接」→「同步应用源」→「翻译待译队列」"
+echo " 3. 打开 应用(Apps) / 插件(Plugins) 页面即可看到中文"
+echo "----------------------------------------------------------"
+echo
+</INLINE>
+</FILE>
+</PLUGIN>

@@ -1,0 +1,511 @@
+Menu="Settings"
+Title="插件中文化"
+Icon="language"
+---
+<?php
+/**
+ * unraid.zh.translator — 设置页
+ */
+require_once '/usr/local/emhttp/plugins/unraid.zh.translator/include/translator.php';
+
+$cfg   = \UZT\Config::all();
+$csrf  = \UZT\csrf_token();
+$keySet = $cfg['API_KEY'] !== '';
+$stats = \UZT\Store::open()->stats();
+$meta  = [
+    'synced_at'    => \UZT\Store::open()->getMeta('synced_at'),
+    'feed_updated' => \UZT\Store::open()->getMeta('feed_updated'),
+    'feed_apps'    => \UZT\Store::open()->getMeta('feed_apps'),
+    'plugins'      => \UZT\Store::open()->getMeta('plugins'),
+];
+$h = static fn($v) => htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8');
+$sel = static function (string $key, array $opts) use ($cfg): string {
+    $out = '';
+    foreach ($opts as $val => $label) {
+        $out .= '<option value="' . htmlspecialchars($val, ENT_QUOTES) . '"'
+            . ($cfg[$key] === (string)$val ? ' selected' : '') . '>' . htmlspecialchars($label, ENT_QUOTES) . '</option>';
+    }
+    return $out;
+};
+?>
+<style>
+.uzt{max-width:1120px}
+.uzt .card{border:1px solid rgba(127,127,127,.35);border-radius:8px;padding:16px 18px;margin:0 0 16px}
+.uzt .card h3{margin:0 0 10px;font-size:1.05em;display:flex;align-items:center;gap:8px}
+.uzt .muted{opacity:.65;font-size:.9em;line-height:1.6}
+.uzt .tabs{display:flex;gap:6px;margin:0 0 16px;flex-wrap:wrap}
+.uzt .tabs button{border:1px solid rgba(127,127,127,.35);background:rgba(127,127,127,.10);color:inherit;
+  padding:8px 16px;border-radius:6px;cursor:pointer;font-size:.95em}
+.uzt .tabs button.on{background:#ff8c2f;border-color:#ff8c2f;color:#fff;font-weight:600}
+.uzt .panel{display:none}
+.uzt .panel.on{display:block}
+.uzt .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:10px 0 4px}
+.uzt .stat{border:1px solid rgba(127,127,127,.3);border-radius:8px;padding:10px 12px;background:rgba(127,127,127,.07)}
+.uzt .stat .n{font-size:1.5em;font-weight:700;line-height:1.2}
+.uzt .stat .l{font-size:.82em;opacity:.7}
+.uzt .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}
+.uzt button.act{border:1px solid rgba(127,127,127,.4);background:rgba(127,127,127,.12);color:inherit;
+  padding:9px 16px;border-radius:6px;cursor:pointer;font-size:.92em}
+.uzt button.act:hover{background:rgba(127,127,127,.2)}
+.uzt button.primary{background:#ff8c2f;border-color:#ff8c2f;color:#fff;font-weight:600}
+.uzt button.primary:hover{filter:brightness(1.06)}
+.uzt button.danger{background:rgba(200,60,60,.18);border-color:rgba(200,60,60,.55);color:#e6787a}
+.uzt .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.78em;
+  border:1px solid rgba(127,127,127,.4);background:rgba(127,127,127,.12)}
+.uzt .badge.ok{border-color:rgba(60,170,90,.6);color:#4caf50;background:rgba(60,170,90,.12)}
+.uzt .badge.warn{border-color:rgba(220,160,40,.6);color:#e0a028;background:rgba(220,160,40,.12)}
+.uzt pre.log{background:#0b0b0b;color:#42d97a;border:1px solid #1d3b25;border-radius:6px;padding:12px;
+  max-height:420px;overflow:auto;font-size:12px;line-height:1.5;white-space:pre-wrap;margin:0}
+.uzt table.kinds{width:100%;border-collapse:collapse;font-size:.9em}
+.uzt table.kinds td,.uzt table.kinds th{padding:6px 8px;border-bottom:1px solid rgba(127,127,127,.25);text-align:left}
+.uzt .bar{height:8px;border-radius:99px;background:rgba(127,127,127,.2);overflow:hidden;margin:8px 0}
+.uzt .bar > i{display:block;height:100%;background:#ff8c2f;width:0}
+.uzt dl dt{font-weight:600}
+.uzt .inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+</style>
+
+<div class="uzt" id="uzt">
+  <div class="tabs">
+    <button data-tab="overview" class="on">概览</button>
+    <button data-tab="model">大模型</button>
+    <button data-tab="dict">词典与任务</button>
+    <button data-tab="log">日志</button>
+  </div>
+
+  <!-- ============================ 概览 ============================ -->
+  <div class="panel on" data-panel="overview">
+    <div class="card">
+      <h3><i class="fa fa-language"></i> 插件中文化 · 状态</h3>
+      <p class="muted">
+        本插件把 <b>Community Applications（应用/插件商店）</b> 与 <b>已安装插件</b> 页面里的英文文案
+        在浏览器端替换为中文。译文按「文本内容哈希」缓存：<b>插件没更新就复用旧译文</b>；
+        文案变了（插件更新、说明改动）会生成新哈希，<b>只重译变化的那几段</b>。
+      </p>
+      <div class="grid">
+        <div class="stat"><div class="n" id="s-done"><?= (int)$stats['done'] ?></div><div class="l">已翻译片段</div></div>
+        <div class="stat"><div class="n" id="s-pending"><?= (int)$stats['pending'] ?></div><div class="l">待翻译</div></div>
+        <div class="stat"><div class="n" id="s-total"><?= (int)$stats['total'] ?></div><div class="l">词条总数</div></div>
+        <div class="stat"><div class="n" id="s-failed"><?= (int)$stats['failed'] ?></div><div class="l">失败片段</div></div>
+        <div class="stat"><div class="n" id="s-chars"><?= number_format((int)$stats['src_chars']) ?></div><div class="l">已译原文字符</div></div>
+        <div class="stat"><div class="n" id="s-bytes"><?= \UZT\human_bytes((int)$stats['db_bytes']) ?></div><div class="l">词库占用</div></div>
+      </div>
+      <div class="bar"><i id="s-bar" style="width:<?= $stats['total'] > 0 ? round($stats['done'] * 100 / $stats['total'], 1) : 0 ?>%"></i></div>
+      <p class="muted" id="env-line">环境自检：—</p>
+      <p class="muted">
+        存储后端 <span class="badge" id="s-backend"><?= $h($stats['backend']) ?></span>
+        · 上次同步 <span id="s-synced"><?= $meta['synced_at'] ? $h(date('Y-m-d H:i', (int)$meta['synced_at'])) : '从未' ?></span>
+        · 应用源更新于 <span id="s-feedupd"><?= $meta['feed_updated'] ? $h($meta['feed_updated']) : '—' ?></span>
+        · 商店应用 <span id="s-feedapps"><?= $h($meta['feed_apps'] ?: '—') ?></span> 个
+        · 本地插件 <span id="s-plugins"><?= $h($meta['plugins'] ?: '—') ?></span> 个
+      </p>
+    </div>
+
+    <div class="card">
+      <h3><i class="fa fa-toggle-on"></i> 开关与生效范围</h3>
+      <dl>
+        <dt>启用翻译</dt>
+        <dd>
+          <select id="ENABLED" class="input">
+            <option value="1" <?= $cfg['ENABLED'] === '1' ? 'selected' : '' ?>>启用</option>
+            <option value="0" <?= $cfg['ENABLED'] === '0' ? 'selected' : '' ?>>停用</option>
+          </select>
+          <span class="muted">停用后浏览器端不再做任何替换。</span>
+        </dd>
+        <dt>生效页面</dt>
+        <dd>
+          <select id="SCOPE" class="input"><?= $sel('SCOPE', [
+              'store' => '仅应用商店（Apps / Community Applications）— 推荐',
+              'store_plugins' => '应用商店 + 原生插件页（Plugins）',
+              'all' => '应用商店 + 插件页 + Docker 页',
+          ]) ?></select>
+        </dd>
+        <dt>自动翻译新文案</dt>
+        <dd>
+          <select id="AUTO_NEW" class="input">
+            <option value="1" <?= $cfg['AUTO_NEW'] === '1' ? 'selected' : '' ?>>自动（看到没译过的英文就翻）</option>
+            <option value="0" <?= $cfg['AUTO_NEW'] === '0' ? 'selected' : '' ?>>只用已有译文</option>
+          </select>
+          <span class="muted">关闭后，只有手动「同步 + 翻译队列」才会产生新译文。</span>
+        </dd>
+        <dt>页面加载即翻译</dt>
+        <dd>
+          <select id="SYNC_ON_LOOKUP" class="input">
+            <option value="1" <?= $cfg['SYNC_ON_LOOKUP'] === '1' ? 'selected' : '' ?>>是（当前页立等译文）</option>
+            <option value="0" <?= $cfg['SYNC_ON_LOOKUP'] === '0' ? 'selected' : '' ?>>否（先入队，后台慢慢翻）</option>
+          </select>
+          <span class="muted">手动关闭时浏览器仍会显示已缓存的译文，未译的保持英文，等后台任务补齐。</span>
+        </dd>
+        <dt>单次同步翻译上限</dt>
+        <dd><input type="text" id="SYNC_MAX_CHARS" class="input" size="10" value="<?= $h($cfg['SYNC_MAX_CHARS']) ?>">
+          <span class="muted">字符。超过就先入队，避免页面等待过久。</span></dd>
+        <dt>每小时同步翻译预算</dt>
+        <dd><input type="text" id="HOURLY_CHAR_BUDGET" class="input" size="10" value="<?= $h($cfg['HOURLY_CHAR_BUDGET']) ?>">
+          <span class="muted">字符/小时，0 = 不限。超出后新文案只入队，由「翻译待译队列」或 cron 处理。</span></dd>
+      </dl>
+      <div class="row">
+        <button class="act primary" data-act="save"><i class="fa fa-save"></i> 保存设置</button>
+        <span id="save-hint" class="muted"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================ 大模型 ============================ -->
+  <div class="panel" data-panel="model">
+    <div class="card">
+      <h3><i class="fa fa-microchip"></i> 大模型接口（OpenAI 兼容）</h3>
+      <p class="muted">
+        支持任何实现 <code>/v1/chat/completions</code> 的服务：OpenAI、DeepSeek、Moonshot、智谱、
+        硅基流动、one-api/NewAPI 中转，以及本地 <code>Ollama</code>（地址填 <code>http://IP:11434/v1</code>）、
+        LM Studio（<code>http://IP:1234/v1</code>）、vLLM 等。<br>
+        密钥只保存在本机 <code>/boot/config/plugins/unraid.zh.translator/translator.cfg</code>（权限 600），不会回传到浏览器。
+      </p>
+      <dl>
+        <dt>API 地址</dt>
+        <dd><input type="text" id="API_BASE" class="input" size="52" value="<?= $h($cfg['API_BASE']) ?>"
+              placeholder="https://api.deepseek.com/v1"></dd>
+        <dt>API Key</dt>
+        <dd class="inline">
+          <input type="password" id="API_KEY" class="input" size="52"
+                 placeholder="<?= $keySet ? '已保存，留空表示不修改' : 'sk-... / ollama 可留空' ?>">
+          <label class="muted"><input type="checkbox" id="API_KEY_CLEAR"> 清除已保存的密钥</label>
+        </dd>
+        <dt>模型</dt>
+        <dd><input type="text" id="MODEL" class="input" size="32" value="<?= $h($cfg['MODEL']) ?>"
+              placeholder="deepseek-chat / gpt-4o-mini / qwen2.5:14b"></dd>
+        <dt>JSON 模式</dt>
+        <dd><select id="JSON_MODE" class="input"><?= $sel('JSON_MODE', ['auto' => 'auto（失败自动降级）', 'on' => '强制开启', 'off' => '关闭']) ?></select></dd>
+        <dt>温度</dt>
+        <dd><input type="text" id="TEMPERATURE" class="input" size="6" value="<?= $h($cfg['TEMPERATURE']) ?>"></dd>
+        <dt>每请求条数 / 字符</dt>
+        <dd class="inline">
+          <input type="text" id="BATCH_ITEMS" class="input" size="5" value="<?= $h($cfg['BATCH_ITEMS']) ?>">
+          <input type="text" id="BATCH_CHARS" class="input" size="7" value="<?= $h($cfg['BATCH_CHARS']) ?>">
+        </dd>
+        <dt>PHP CLI 路径</dt>
+        <dd><input type="text" id="PHP_CLI" class="input" size="30" value="<?= $h($cfg['PHP_CLI']) ?>"
+              placeholder="留空自动探测（/usr/bin/php）">
+          <span class="muted">只有「后台任务启动失败」时才需要手填。</span></dd>
+        <dt>超时 / 重试</dt>
+        <dd class="inline">
+          <input type="text" id="TIMEOUT" class="input" size="5" value="<?= $h($cfg['TIMEOUT']) ?>"> 秒
+          <input type="text" id="RETRIES" class="input" size="4" value="<?= $h($cfg['RETRIES']) ?>"> 次
+        </dd>
+      </dl>
+      <div class="row">
+        <button class="act primary" data-act="save"><i class="fa fa-save"></i> 保存设置</button>
+        <button class="act" data-act="test"><i class="fa fa-vial"></i> 测试连接</button>
+        <span id="test-hint" class="muted"></span>
+      </div>
+      <div id="test-out" class="muted" style="margin-top:8px;white-space:pre-wrap"></div>
+    </div>
+  </div>
+
+  <!-- ============================ 词典与任务 ============================ -->
+  <div class="panel" data-panel="dict">
+    <div class="card">
+      <h3><i class="fa fa-database"></i> 同步与翻译任务</h3>
+      <p class="muted">
+        一次「同步」会下载应用源（约 20MB），抽出简介/要求/分类/字段说明等片段并按内容哈希去重；
+        只有哈希没见过的片段才会进入待译队列，所以<b>重复同步几乎零成本</b>。
+      </p>
+      <div class="row">
+        <button class="act primary" data-act="sync"><i class="fa fa-cloud-download"></i> 同步应用源</button>
+        <button class="act" data-act="sync" data-force="1"><i class="fa fa-refresh"></i> 强制重新下载</button>
+        <button class="act" data-act="translate"><i class="fa fa-language"></i> 翻译待译队列</button>
+        <span class="muted" id="auto-continue-hint">到达时间预算后会自动续跑</span>
+        <button class="act" data-act="retry-failed"><i class="fa fa-rotate-right"></i> 重试失败片段</button>
+        <button class="act" data-act="compact"><i class="fa fa-filter"></i> 精简队列（只保留简介类）</button>
+        <button class="act" data-act="drop-pending"><i class="fa fa-scissors"></i> 清空未译队列（改为纯按需）</button>
+        <button class="act" data-act="prune"><i class="fa fa-eraser"></i> 清理已下架词条</button>
+        <span id="task-hint" class="muted"></span>
+      </div>
+      <div class="row">
+        <button class="act danger" data-act="wipe"><i class="fa fa-trash"></i> 清空全部译文重新开始</button>
+        <button class="act danger" data-act="defaults"><i class="fa fa-undo"></i> 恢复默认设置</button>
+      </div>
+      <p class="muted" id="est-line">—</p>
+      <p class="muted" id="fail-line" style="display:none"></p>
+      <p class="muted" id="worker-state">后台任务状态：空闲</p>
+    </div>
+
+    <div class="card">
+      <h3><i class="fa fa-clock-o"></i> 定时任务</h3>
+      <dl>
+        <dt>应用源</dt>
+        <dd><select id="FEED_SOURCE" class="input"><?= $sel('FEED_SOURCE', [
+            'auto' => '自动：优先复用 CA 本地缓存（推荐）',
+            'local' => '仅用 CA 本地缓存（离线可用，需先打开一次 Apps 页）',
+            'online' => '仅在线下载',
+        ]) ?></select>
+          <span class="muted">CA 插件把应用源放在 <code>/tmp/GitHub/AppFeed/applicationFeed.json</code>，
+            本插件直接复用它，并在时间戳过期时才去官方 CDN 拉取。</span></dd>
+        <dt>在线源地址</dt>
+        <dd><input type="text" id="FEED_URL" class="input" size="60" value="<?= $h($cfg['FEED_URL']) ?>">
+          <span class="muted">默认官方 <code>assets.ca.unraid.net</code>，失败会自动退回 GitHub 备份。</span></dd>
+        <dt>Cron</dt>
+        <dd class="inline">
+          <input type="text" id="CRON" class="input" size="18" value="<?= $h($cfg['CRON']) ?>" placeholder="0 4 * * *">
+          <span class="muted">5 段格式；留空=关闭。建议每天一次，自动同步并把队列翻完。</span>
+        </dd>
+        <dt>单次运行预算</dt>
+        <dd><input type="text" id="WORKER_SECONDS" class="input" size="6" value="<?= $h($cfg['WORKER_SECONDS']) ?>"> 秒
+          <span class="muted">超过就停，下次继续。</span></dd>
+      </dl>
+      <div class="row"><button class="act primary" data-act="save"><i class="fa fa-save"></i> 保存设置</button></div>
+    </div>
+
+    <div class="card">
+      <h3><i class="fa fa-list-ol"></i> 分类覆盖率</h3>
+      <table class="kinds">
+        <thead><tr><th>片段类型</th><th>总数</th><th>已译</th><th>覆盖率</th></tr></thead>
+        <tbody id="kinds-body"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ============================ 日志 ============================ -->
+  <div class="panel" data-panel="log">
+    <div class="card">
+      <h3><i class="fa fa-terminal"></i> 运行日志</h3>
+      <pre class="log" id="log-box">加载中…</pre>
+      <div class="row">
+        <button class="act" data-act="refresh"><i class="fa fa-refresh"></i> 刷新</button>
+        <label class="muted"><input type="checkbox" id="auto-refresh" checked> 自动刷新（3 秒）</label>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var CSRF = <?= json_encode($csrf, JSON_HEX_TAG | JSON_HEX_AMP) ?>;
+  var API = '/plugins/unraid.zh.translator/ajax';
+  var FIELDS = ['ENABLED','SCOPE','AUTO_NEW','SYNC_ON_LOOKUP','SYNC_MAX_CHARS','HOURLY_CHAR_BUDGET','PHP_CLI','FEED_SOURCE','FEED_URL',
+    'API_BASE','MODEL','JSON_MODE','TEMPERATURE','BATCH_ITEMS','BATCH_CHARS','TIMEOUT','RETRIES',
+    'CRON','WORKER_SECONDS'];
+
+  function $(id) { return document.getElementById(id); }
+  function post(action, extra) {
+    var body = Object.assign({ action: action, csrf: CSRF }, extra || {});
+    return fetch(API + '/settings.php', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); });
+  }
+  function get(action, extra) {
+    var q = new URLSearchParams(Object.assign({ csrf: CSRF }, extra || {}));
+    return fetch(API + '/' + action + '.php?' + q.toString(), { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); });
+  }
+  function hint(el, text, cls) {
+    if (typeof el === 'string') { el = $(el); }
+    if (!el) { return; }
+    el.textContent = text || '';
+    el.className = 'muted' + (cls ? ' ' + cls : '');
+  }
+  function collect() {
+    var cfg = {};
+    FIELDS.forEach(function (f) { if ($(f)) { cfg[f] = $(f).value; } });
+    var keyInput = $('API_KEY');
+    if (keyInput && keyInput.value.trim() !== '') { cfg.API_KEY = keyInput.value.trim(); }
+    return cfg;
+  }
+  function save(silent) {
+    var payload = { config: collect() };
+    if ($('API_KEY_CLEAR') && $('API_KEY_CLEAR').checked) { payload.clear_key = true; }
+    return post('save', payload).then(function (res) {
+      if (!res.ok) { hint('save-hint', '保存失败：' + (res.error || ''), 'warn'); return res; }
+      if (!res.ok && res.error) {
+        hint('save-hint', '保存失败：' + res.error, 'warn');
+        return res;
+      }
+      var msg = '已保存';
+      if (res.errors && res.errors.length) { msg += '（提示：' + res.errors.join('；') + '）'; }
+      if (res.cron_changed) { msg += ' · Cron 已重载'; }
+      if (!silent) { hint('save-hint', msg, 'ok'); setTimeout(function(){ hint('save-hint',''); }, 4000); }
+      if ($('API_KEY')) { $('API_KEY').value = ''; }
+      if ($('API_KEY_CLEAR')) { $('API_KEY_CLEAR').checked = false; }
+      return res;
+    });
+  }
+
+  // 标签页
+  document.querySelectorAll('.uzt .tabs button').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.querySelectorAll('.uzt .tabs button').forEach(function (b) { b.classList.remove('on'); });
+      document.querySelectorAll('.uzt .panel').forEach(function (p) { p.classList.remove('on'); });
+      btn.classList.add('on');
+      var p = document.querySelector('.uzt .panel[data-panel="' + btn.dataset.tab + '"]');
+      if (p) { p.classList.add('on'); }
+      if (btn.dataset.tab === 'log') { refresh(); }
+    });
+  });
+
+  // 按钮
+  document.querySelectorAll('.uzt button.act').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var act = btn.dataset.act;
+      if (act === 'save') { save(false); return; }
+      if (act === 'test') {
+        hint('test-hint', '测试中…');
+        $('test-out').textContent = '';
+        save(true).then(function () {
+          return post('test');
+        }).then(function (res) {
+          var r = res.result || res;
+          if (r.ok) {
+            hint('test-hint', '连接正常（' + r.ms + ' ms）', 'ok');
+            $('test-out').textContent = '模型 ' + r.model + '\n原文：' + r.sample_src + '\n译文：' + r.sample_dst;
+          } else {
+            hint('test-hint', '失败：' + (r.error || res.error || '未知错误'), 'warn');
+          }
+        }).catch(function (e) { hint('test-hint', '请求异常：' + e, 'warn'); });
+        return;
+      }
+      if (act === 'refresh') { refresh(); return; }
+      if (act === 'wipe' && !confirm('将清空全部已保存译文（不影响设置），确定吗？')) { return; }
+      if (act === 'drop-pending' && !confirm('将删除所有「未翻译」的条目，之后只在你浏览页面时按需翻译（已译的保留）。确定吗？')) { return; }
+      if (act === 'defaults' && !confirm('恢复默认设置（含清空 API Key）？译文缓存不会动。')) { return; }
+      btn.disabled = true;
+      var extra = btn.dataset.force ? { force: 1 } : {};
+      hint('task-hint', '执行中…');
+      post(act, extra).then(function (res) {
+        btn.disabled = false;
+        if (act === 'save') { return; }
+        if (!res.ok) { hint('task-hint', '失败：' + (res.error || ''), 'warn'); return; }
+        if (act === 'sync' || act === 'translate') {
+          hint('task-hint', '已启动后台任务，进度见下方日志', 'ok');
+        } else if (act === 'drop-pending') {
+          hint('task-hint', '已清空未译队列（删除 ' + (res.removed || 0) + ' 条），之后按需翻译', 'ok');
+        } else if (act === 'compact') {
+          hint('task-hint', '已删除 ' + (res.removed || 0) + ' 条短文本/本机插件片段（阈值 ' + (res.min_chars || 0) + ' 字符）', 'ok');
+        } else if (act === 'retry-failed') {
+          hint('task-hint', '已把 ' + (res.reset || 0) + ' 条失败片段放回队列', 'ok');
+        } else if (act === 'prune') {
+          hint('task-hint', '已清理 ' + (res.result ? res.result.removed : 0) + ' 条过期词条', 'ok');
+        } else if (act === 'wipe') {
+          hint('task-hint', '译文已清空', 'ok');
+        } else if (act === 'defaults') {
+          hint('task-hint', '已恢复默认，请刷新页面', 'ok');
+        }
+        refresh();
+      }).catch(function (e) {
+        btn.disabled = false;
+        hint('task-hint', '请求异常：' + e, 'warn');
+      });
+    });
+  });
+
+  // 状态轮询
+  function fmt(n) { return (n === null || n === undefined) ? '—' : Number(n).toLocaleString(); }
+  function humanDur(sec) {
+    if (!sec || sec < 0) { return '—'; }
+    if (sec < 90) { return sec + ' 秒'; }
+    if (sec < 5400) { return Math.round(sec / 60) + ' 分钟'; }
+    return (sec / 3600).toFixed(1) + ' 小时';
+  }
+  function kindName(k) {
+    var map = { overview: '应用简介', requires: '运行要求', cat: '分类名称', field: '模板字段说明',
+      fieldname: '模板字段名', branch: '分支说明', note: '应用备注',
+      localdesc: '本地插件描述', localchg: '本地插件更新日志', live: '页面即时采集', '': '未分类' };
+    return map[k] || k;
+  }
+  var lastRev = null;
+  function refresh() {
+    if (document.hidden) { return Promise.resolve(); }
+    var light = (lastRev !== null);
+    return get('status', light ? { light: 1 } : {}).then(function (res) {
+      if (!res.ok) { return; }
+      if (light && res.revision !== undefined && String(res.revision) === String(lastRev)) {
+        $('worker-state').textContent = '后台任务状态：' + (res.worker_running ? '运行中…' : '空闲');
+        return;
+      }
+      lastRev = (res.stats && res.stats.revision) || res.revision || null;
+      var s = res.stats || {};
+      $('s-done').textContent = fmt(s.done);
+      $('s-pending').textContent = fmt(s.pending);
+      $('s-total').textContent = fmt(s.total);
+      $('s-failed').textContent = fmt(s.failed);
+      $('s-chars').textContent = fmt(s.src_chars);
+      var pct = s.total > 0 ? Math.round(s.done * 1000 / s.total) / 10 : 0;
+      $('s-bar').style.width = pct + '%';
+      $('s-backend').textContent = s.backend || '—';
+      if (res.meta) {
+        $('s-synced').textContent = res.meta.synced_at ? new Date(res.meta.synced_at * 1000).toLocaleString() : '从未';
+        $('s-feedupd').textContent = res.meta.feed_updated || '—';
+        $('s-feedapps').textContent = res.meta.feed_apps || '—';
+        $('s-plugins').textContent = res.meta.plugins || '—';
+      }
+      // 词库占用（字节）
+      var by = document.getElementById('s-bytes');
+      if (by && typeof s.db_bytes === 'number') {
+        var u = ['B','KB','MB','GB'], n = s.db_bytes, i = 0;
+        while (n >= 1024 && i < 3) { n = Math.round(n / 1024); i++; }
+        by.textContent = n + u[i];
+      }
+      if (res.failures && res.failures.length) {
+        var fl = document.getElementById('fail-line');
+        if (fl) {
+          fl.style.display = '';
+          fl.textContent = '最近失败原因：' + res.failures.map(function (f) {
+            return (f.err || '未知').slice(0, 60) + ' ×' + f.n;
+          }).join(' · ') + '（修好后点「重试失败片段」）';
+        }
+      }
+      if (res.env) {
+        var e2 = res.env;
+        var bits2 = [];
+        bits2.push('PHP CLI ' + (e2.php_cli || '未找到'));
+        bits2.push('日志目录' + (e2.log_writable ? '可写' : '不可写'));
+        bits2.push('/boot' + (e2.boot_writable ? '可写' : '不可写'));
+        if (e2.ca_local && e2.ca_local.file) {
+          bits2.push('CA 本地源 ' + humanDur(e2.ca_local.age) + '前');
+        } else {
+          bits2.push('未发现 CA 本地源');
+        }
+        if (e2.feed_source) {
+          var srcName = { 'ca-local': 'CA 本地缓存', 'cdn': '官方 CDN', 'github': 'GitHub 备份', 'own-cache': '本地下载缓存', 'custom': '自定义源' };
+          bits2.push('上次同步用 ' + (srcName[e2.feed_source] || e2.feed_source));
+        }
+        var el2 = document.getElementById('env-line');
+        if (el2) {
+          el2.textContent = '环境自检：' + bits2.join(' · ');
+          if (!e2.log_writable || !e2.boot_writable || !e2.php_cli) {
+            el2.style.color = '#e0a028';
+          }
+        }
+      }
+      if (res.estimate) {
+        var e = res.estimate;
+        var bits = ['待译 ' + fmt(e.pending) + ' 条', '约 ' + fmt(e.pending_chars) + ' 字符',
+          '约 ' + fmt(e.requests) + ' 次请求'];
+        if (e.avg_req_ms > 0) {
+          bits.push('按上轮实测 ' + e.avg_req_ms + ' ms/次，预计 ' + humanDur(e.eta_seconds));
+        }
+        var line = document.getElementById('est-line');
+        if (line) { line.textContent = '队列估算：' + bits.join(' · '); }
+      }
+      $('worker-state').textContent = '后台任务状态：' + (res.worker_running ? '运行中…' : '空闲')
+        + ' · 待译 ' + fmt(s.pending) + ' 条';
+      var tb = $('kinds-body');
+      if (tb && res.kinds) {
+        tb.innerHTML = res.kinds.map(function (k) {
+          var p = k.total > 0 ? Math.round(k.done * 1000 / k.total) / 10 : 0;
+          return '<tr><td>' + kindName(k.kind) + '</td><td>' + fmt(k.total) + '</td><td>' + fmt(k.done)
+            + '</td><td>' + p + '%</td></tr>';
+        }).join('') || '<tr><td colspan="4" class="muted">暂无数据，先点「同步应用源」</td></tr>';
+      }
+      if ($('auto-refresh') && $('auto-refresh').checked) {
+        var box = $('log-box');
+        var atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+        box.textContent = res.log || '（暂无日志）';
+        if (atBottom) { box.scrollTop = box.scrollHeight; }
+      }
+    }).catch(function () { /* 静默 */ });
+  }
+
+  refresh();
+  setInterval(refresh, 3000);
+})();
+</script>
