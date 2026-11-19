@@ -128,6 +128,7 @@ echo
 PLGTAIL
 
 mv "$TMP" "$OUT"
+cp -f "$OUT" "${NAME}.plg"
 trap - EXIT
 
 # 自检：XML 必须能解析（历史上踩过 && 裸 & 把包写坏的坑）
@@ -137,4 +138,4 @@ d = m.parse(sys.argv[1])
 files = [f for f in d.getElementsByTagName('FILE') if f.getAttribute('Name')]
 assert files, '没有内联任何文件'
 PYCHK
-echo "已生成: $OUT ($(wc -c < "$OUT") 字节, $(grep -c '<FILE ' "$OUT") 个文件)"
+echo "已生成: $OUT 与 ./${NAME}.plg ($(wc -c < "$OUT") 字节, $(grep -c '<FILE ' "$OUT") 个文件)"

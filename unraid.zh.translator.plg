@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name "unraid.zh.translator">
 <!ENTITY author "YG">
-<!ENTITY version "2026.11.19">
+<!ENTITY version "2026.11.24">
 <!ENTITY launch "Settings/unraid.zh.translator">
 <!ENTITY plugdir "/boot/config/plugins/&name;">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/jiege6-66/unraid-zh-translator/main/unraid.zh.translator.plg">
@@ -17,7 +17,7 @@
 纯前端替换，不修改任何宿主机文件，卸载即恢复英文。
 </DESCRIPTION>
 <CHANGES>
-### 2026.11.19
+### 2026.11.24
 - 应用商店（Community Applications）与已安装插件页面的英文文案自动译为中文
 - 译文按内容哈希缓存：插件未更新则复用译文，文案变化只重译改动片段
 - 支持任何 OpenAI 兼容接口（含本地 Ollama / LM Studio）
@@ -45,7 +45,7 @@ mkdir -p &plugdir;
 mkdir -p &plugdir;/logs;
 chmod 0770 &plugdir; &plugdir;/logs 2>/dev/null
 [ -w &plugdir; ] || echo "警告：&plugdir; 不可写（/boot 只读或已满），设置将无法保存"
-echo "安装 &name; 2026.11.19"
+echo "安装 &name; 2026.11.24"
 </INLINE>
 </FILE>
 <FILE Name="/usr/local/emhttp/plugins/unraid.zh.translator/ajax/configjs.php" Mode="0755"><INLINE><![CDATA[<?php
